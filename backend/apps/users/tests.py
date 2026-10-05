@@ -1,0 +1,522 @@
+import io
+import tempfile
+from unittest.mock import patch
+
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
+from django.core.management.base import CommandError
+from django.test import TestCase, override_settings
+from PIL import Image
+from rest_framework import status
+from rest_framework.test import APITestCase
+
+from .models import AISummary, DocumentChunk, LectureContent, QuizQuestionUsage, User
+from .services.academic_ai import (
+    AcademicAIScopeError,
+    NOT_FOUND_MESSAGE,
+    ask_academic_question,
+    summarize_academic_lecture,
+)
+from .views import NO_LECTURE_CONTENT_MESSAGE
+
+
+class OwnerAccountTests(APITestCase):
+    @override_settings(OWNER_UNIVERSITY_ID="42510677")
+    @patch(
+        "apps.users.management.commands.create_owner.getpass",
+        side_effect=["Test-only!Secure-9427", "Test-only!Secure-9427"],
+    )
+    def test_owner_is_created_securely_and_can_login_by_university_id(
+        self,
+        getpass_mock,
+    ):
+        output = io.StringIO()
+        call_command("create_owner", full_name="Platform Owner", stdout=output)
+
+        owner = User.objects.get(university_id="42510677")
+        self.assertEqual(owner.role, User.Role.OWNER)
+        self.assertTrue(owner.is_superuser)
+        self.assertTrue(owner.is_staff)
+        self.assertTrue(owner.check_password("Test-only!Secure-9427"))
+        self.assertNotIn("Test-only!Secure-9427", output.getvalue())
+        self.assertEqual(getpass_mock.call_count, 2)
+
+        response = self.client.post(
+            "/api/auth/login/",
+            {
+                "university_id": "42510677",
+                "password": "Test-only!Secure-9427",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["user"]["role"], User.Role.OWNER)
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {response.data['access']}"
+        )
+        self.assertEqual(
+            self.client.get("/api/auth/admin-test/").status_code,
+            status.HTTP_200_OK,
+        )
+
+    @override_settings(OWNER_UNIVERSITY_ID="42510677")
+    def test_owner_command_refuses_to_promote_an_existing_account(self):
+        existing_user = User.objects.create_user(
+            username="existing-student",
+            password="Test-only!Secure-9427",
+            university_id="42510677",
+        )
+
+        with self.assertRaises(CommandError):
+            call_command("create_owner", stdout=io.StringIO())
+
+        existing_user.refresh_from_db()
+        self.assertEqual(existing_user.role, User.Role.STUDENT)
+        self.assertFalse(existing_user.is_superuser)
+
+
+class OwnerDashboardTests(APITestCase):
+    def setUp(self):
+        self.url = "/api/auth/owner/dashboard/"
+        self.owner = User.objects.create_superuser(
+            username="dashboard-owner",
+            password="Test-only!Secure-9427",
+            role=User.Role.OWNER,
+            university_id="42510677",
+        )
+
+    def test_owner_receives_database_backed_metrics(self):
+        User.objects.create_user(
+            username="dashboard-student",
+            password="test-password",
+            academic_year=2,
+        )
+        LectureContent.objects.create(
+            subject="Computer Architecture",
+            lecture_number=2,
+            content="Lecture text",
+        )
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["metrics"]["total_students"], 1)
+        self.assertEqual(response.data["metrics"]["total_lectures"], 2)
+        self.assertEqual(response.data["owner"]["university_id"], "42510677")
+
+    def test_student_cannot_access_owner_dashboard(self):
+        student = User.objects.create_user(
+            username="dashboard-student",
+            password="test-password",
+            academic_year=2,
+        )
+        self.client.force_authenticate(user=student)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class ProfileImageUploadTests(APITestCase):
+    def setUp(self):
+        self.media_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.media_directory.cleanup)
+        media_settings = override_settings(MEDIA_ROOT=self.media_directory.name)
+        media_settings.enable()
+        self.addCleanup(media_settings.disable)
+
+        self.user = User.objects.create_user(
+            username="photo-student",
+            password="test-password",
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def test_profile_image_can_be_uploaded(self):
+        image_bytes = io.BytesIO()
+        Image.new("RGB", (1, 1), color="white").save(image_bytes, format="PNG")
+        photo = SimpleUploadedFile(
+            "profile.png",
+            image_bytes.getvalue(),
+            content_type="image/png",
+        )
+
+        response = self.client.patch(
+            "/api/auth/me/",
+            {"profile_image": photo},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("/media/profiles/", response.data["profile_image"])
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.profile_image.name)
+
+
+class QuizLectureAvailabilityTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="quiz-student",
+            password="test-password",
+        )
+        self.client.force_authenticate(user=self.user)
+        self.url = "/api/auth/quizzes/setup/"
+        self.valid_payload = {
+            "subject": "Digital Logic Design",
+            "lecture": 1,
+            "count": 10,
+            "difficulty": "medium",
+        }
+
+    def test_setup_rejects_lecture_without_uploaded_content(self):
+        response = self.client.post(self.url, self.valid_payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.data["detail"], NO_LECTURE_CONTENT_MESSAGE)
+
+    def test_availability_endpoint_reports_missing_content(self):
+        response = self.client.get(
+            "/api/auth/quizzes/availability/",
+            {"subject": self.valid_payload["subject"], "lecture": 1},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["available"])
+        self.assertEqual(response.data["message"], NO_LECTURE_CONTENT_MESSAGE)
+
+    @patch("apps.users.views._generate_questions_from_model")
+    def test_setup_generates_questions_after_content_is_uploaded(
+        self,
+        generate_questions,
+    ):
+        LectureContent.objects.create(
+            subject=self.valid_payload["subject"],
+            lecture_number=self.valid_payload["lecture"],
+            content="Uploaded lecture notes.",
+        )
+        generate_questions.return_value = [
+            {
+                "question": f"ما نتيجة الفكرة رقم {index} في المذكرة؟",
+                "options": ["الإجابة أ", "الإجابة ب", "الإجابة ج", "الإجابة د"],
+                "correct_index": index % 4,
+                "explanation": f"شرح السؤال رقم {index}.",
+            }
+            for index in range(10)
+        ]
+
+        response = self.client.post(self.url, self.valid_payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["lecture"], 1)
+        self.assertEqual(len(response.data["questions"]), 10)
+
+    def test_setup_rejects_invalid_question_count(self):
+        LectureContent.objects.create(
+            subject=self.valid_payload["subject"],
+            lecture_number=self.valid_payload["lecture"],
+            content="Uploaded lecture notes.",
+        )
+        payload = {**self.valid_payload, "count": 75}
+
+        response = self.client.post(self.url, payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_setup_rejects_non_string_subject_without_server_error(self):
+        payload = {**self.valid_payload, "subject": {"invalid": "value"}}
+
+        response = self.client.post(self.url, payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class ComputerArchitectureLectureOneTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="architecture-student",
+            password="test-password",
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def test_first_lecture_is_available(self):
+        response = self.client.get(
+            "/api/auth/quizzes/availability/",
+            {"subject": "Computer Architecture", "lecture": 1},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["available"])
+
+    def test_quiz_uses_first_lecture_questions(self):
+        with patch(
+            "apps.users.views._generate_questions_from_model",
+            return_value=self._generated_questions("فون نيومان", 10),
+        ) as generate_questions:
+            response = self.client.post(
+                "/api/auth/quizzes/setup/",
+                {
+                    "subject": "Computer Architecture",
+                    "lecture": 1,
+                    "count": 10,
+                    "difficulty": "medium",
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["questions"]), 10)
+        self.assertTrue(
+            any("فون نيومان" in item["question"] for item in response.data["questions"])
+        )
+        generate_questions.assert_called_once()
+
+    def test_questions_are_not_reused_in_later_quizzes(self):
+        with patch(
+            "apps.users.views._generate_questions_from_model",
+            side_effect=[
+                self._generated_questions("الأولى", 10),
+                self._generated_questions("الثانية", 10),
+            ],
+        ):
+            first_response = self._request_quiz()
+            second_response = self._request_quiz()
+
+        self.assertEqual(first_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(second_response.status_code, status.HTTP_200_OK)
+        first_questions = {
+            item["question"] for item in first_response.data["questions"]
+        }
+        second_questions = {
+            item["question"] for item in second_response.data["questions"]
+        }
+        self.assertTrue(first_questions.isdisjoint(second_questions))
+        self.assertEqual(QuizQuestionUsage.objects.filter(user=self.user).count(), 20)
+
+    def test_duplicate_generated_questions_are_rejected(self):
+        first_batch = self._generated_questions("مكرر", 9)
+        first_batch.append(first_batch[0])
+        with patch(
+            "apps.users.views._generate_questions_from_model",
+            side_effect=[first_batch, self._generated_questions("إضافي", 1)],
+        ):
+            response = self._request_quiz()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        question_texts = [item["question"] for item in response.data["questions"]]
+        self.assertEqual(len(question_texts), len(set(question_texts)))
+
+    @patch.dict("os.environ", {"GEMINI_API_KEY": ""})
+    def test_generation_reports_missing_ai_configuration(self):
+        response = self._request_quiz()
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+        self.assertIn("غير مفعّل", response.data["detail"])
+        self.assertEqual(QuizQuestionUsage.objects.filter(user=self.user).count(), 0)
+
+    def _request_quiz(self):
+        return self.client.post(
+            "/api/auth/quizzes/setup/",
+            {
+                "subject": "Computer Architecture",
+                "lecture": 1,
+                "count": 10,
+                "difficulty": "medium",
+            },
+            format="json",
+        )
+
+    @staticmethod
+    def _generated_questions(prefix, count):
+        return [
+            {
+                "question": f"{prefix}: حلل الفكرة رقم {index} في بنية الحاسوب؟",
+                "options": ["اختيار أ", "اختيار ب", "اختيار ج", "اختيار د"],
+                "correct_index": index % 4,
+                "explanation": f"تفسير الإجابة الصحيحة للسؤال {index}.",
+            }
+            for index in range(count)
+        ]
+
+
+class AcademicAIChatAPITests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="ai-student",
+            password="test-password",
+            academic_year=2,
+        )
+        self.client.force_authenticate(user=self.user)
+        self.url = "/api/auth/ai/chat/"
+
+    def test_chat_requires_a_subject(self):
+        response = self.client.post(
+            self.url,
+            {"message": "اشرح الفكرة"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_student_cannot_ask_about_another_year_subject(self):
+        response = self.client.post(
+            self.url,
+            {"message": "اشرح التعلم الآلي", "subject": "Machine Learning"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @patch("apps.users.views.ask_academic_question")
+    def test_chat_returns_answer_and_material_sources(self, ask_question):
+        ask_question.return_value = {
+            "reply": "تعمل وحدة التحكم على تنسيق التنفيذ. [S1]",
+            "sources": [{
+                "source_id": "S1",
+                "file_name": "lecture.pdf",
+                "subject": "Computer Architecture",
+                "lecture_number": 1,
+                "page_number": 4,
+            }],
+        }
+
+        response = self.client.post(
+            self.url,
+            {
+                "message": "ما وظيفة وحدة التحكم؟",
+                "subject": "Computer Architecture",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["subject"], "Computer Architecture")
+        self.assertEqual(response.data["sources"][0]["page_number"], 4)
+
+
+class AcademicAIRetrievalTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="rag-student",
+            password="test-password",
+            academic_year=2,
+        )
+        self.lecture, _ = LectureContent.objects.update_or_create(
+            subject="Computer Architecture",
+            lecture_number=1,
+            defaults={
+                "content": "The control unit coordinates instruction execution.",
+            },
+        )
+
+    @patch("apps.users.services.academic_ai.GeminiClient")
+    def test_relevant_answer_is_grounded_and_has_source(self, gemini_class):
+        client = gemini_class.return_value
+        client.embed_texts.side_effect = [[[1.0, 0.0]], [[1.0, 0.0]]]
+        client.generate_grounded_answer.return_value = (
+            "The control unit coordinates instruction execution. [S1]"
+        )
+
+        result = ask_academic_question(
+            user=self.user,
+            subject="Computer Architecture",
+            question="What does the control unit do?",
+        )
+
+        self.assertIn("[S1]", result["reply"])
+        self.assertEqual(result["sources"][0]["lecture_number"], 1)
+        self.assertEqual(DocumentChunk.objects.filter(academic_year=2).count(), 1)
+
+    @patch("apps.users.services.academic_ai.GeminiClient")
+    def test_unrelated_question_is_refused_without_generation(self, gemini_class):
+        client = gemini_class.return_value
+        client.embed_texts.side_effect = [[[0.0, 1.0]], [[1.0, 0.0]]]
+
+        result = ask_academic_question(
+            user=self.user,
+            subject="Computer Architecture",
+            question="What is today's weather?",
+        )
+
+        self.assertEqual(result["reply"], NOT_FOUND_MESSAGE)
+        self.assertEqual(result["sources"], [])
+        client.generate_grounded_answer.assert_not_called()
+
+    @patch("apps.users.services.academic_ai.GeminiClient")
+    def test_subject_scope_is_checked_before_document_retrieval(self, gemini_class):
+        with self.assertRaises(AcademicAIScopeError) as raised:
+            ask_academic_question(
+                user=self.user,
+                subject="Machine Learning",
+                question="Explain neural networks.",
+            )
+
+        self.assertEqual(str(raised.exception), "هذه المادة غير متاحة لفرقتك الدراسية.")
+        gemini_class.assert_not_called()
+
+
+class AISummaryAPITests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="summary-student",
+            password="test-password",
+            academic_year=2,
+        )
+        self.client.force_authenticate(user=self.user)
+        self.url = "/api/auth/ai/summarize/"
+        self.payload = {
+            "subject": "Computer Architecture",
+            "lecture": 1,
+            "summary_type": "quick",
+        }
+
+    @patch("apps.users.services.academic_ai.GeminiClient")
+    def test_summary_is_saved_with_its_material_source(self, gemini_class):
+        client = gemini_class.return_value
+        client.embed_texts.side_effect = lambda texts, task_type: [
+            [1.0, 0.0] for _ in texts
+        ]
+        client.generate_grounded_answer.return_value = (
+            "تلخص المحاضرة بنية الحاسوب ودورة تنفيذ التعليمات. [S1]"
+        )
+
+        response = self.client.post(self.url, self.payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("[S1]", response.data["summary"])
+        self.assertEqual(response.data["sources"][0]["subject"], self.payload["subject"])
+        self.assertEqual(
+            AISummary.objects.filter(user=self.user, academic_year=2).count(),
+            1,
+        )
+
+    def test_summary_rejects_a_subject_outside_the_student_year(self):
+        response = self.client.post(
+            self.url,
+            {**self.payload, "subject": "Machine Learning"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(AISummary.objects.filter(user=self.user).exists())
+
+    def test_summary_requires_a_lecture_number(self):
+        response = self.client.post(
+            self.url,
+            {"subject": self.payload["subject"], "summary_type": "quick"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_summary_service_reuses_academic_scope_validation(self):
+        with self.assertRaises(AcademicAIScopeError):
+            summarize_academic_lecture(
+                user=self.user,
+                subject="Machine Learning",
+                lecture_number=1,
+                summary_type="quick",
+            )
