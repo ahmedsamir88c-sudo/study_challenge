@@ -1,50 +1,59 @@
-import 'dart:convert';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/foundation.dart';
+import 'package:firebase_auth/firebase_auth.dart' as firebase_auth;
 
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:http/http.dart' as http;
-
-import '../core/constants.dart';
-
-/// نموذج بيانات المستخدم
 class AuthUser {
+  final String uid;
   final String username;
   final String role;
   final String? universityId;
   final int? academicYear;
   final String? fullName;
   final String? email;
+  final String? profilePicture;
+  final int xpPoints;
+  final String studentStatus;
 
   const AuthUser({
+    required this.uid,
     required this.username,
     required this.role,
     this.universityId,
     this.academicYear,
     this.fullName,
     this.email,
+    this.profilePicture,
+    this.xpPoints = 0,
+    this.studentStatus = 'active',
   });
 
-  factory AuthUser.fromJson(Map<String, dynamic> json) => AuthUser(
-    username: json['username'] as String? ?? '',
-    role: json['role'] as String? ?? 'student',
-    universityId: json['university_id'] as String?,
-    academicYear: json['academic_year'] is int
-        ? json['academic_year'] as int
-        : int.tryParse(json['academic_year']?.toString() ?? ''),
-    fullName: json['full_name'] as String?,
-    email: json['email'] as String?,
-  );
+  factory AuthUser.fromFirestore(String uid, Map<String, dynamic> data) =>
+      AuthUser(
+        uid: uid,
+        username: data['username'] as String? ?? '',
+        role: data['role'] as String? ?? 'student',
+        universityId: data['universityId'] as String?,
+        academicYear: data['academicYear'] as int?,
+        fullName: data['fullName'] as String?,
+        email: data['email'] as String?,
+        profilePicture: data['profilePicture'] as String?,
+        xpPoints: data['xpPoints'] as int? ?? 0,
+        studentStatus: data['studentStatus'] as String? ?? 'active',
+      );
 
   Map<String, dynamic> toJson() => {
+    'uid': uid,
     'username': username,
     'role': role,
     'university_id': universityId,
     'academic_year': academicYear,
     'full_name': fullName,
     'email': email,
+    'profile_picture': profilePicture,
+    'xp_points': xpPoints,
   };
 }
 
-/// نتيجة عملية المصادقة
 class AuthResult {
   final bool success;
   final String? errorMessage;
@@ -55,303 +64,401 @@ class AuthResult {
   const AuthResult.failure(this.errorMessage) : success = false, user = null;
 }
 
-/// خدمة المصادقة المركزية
 class AuthService {
   AuthService._();
   static final AuthService instance = AuthService._();
 
-  // ─── Secure Storage ────────────────────────────────────
-  static const _storage = FlutterSecureStorage(
-    aOptions: AndroidOptions(encryptedSharedPreferences: true),
-  );
+  static const requiredAcademicYear = 2;
+
+  final firebase_auth.FirebaseAuth _auth = firebase_auth.FirebaseAuth.instance;
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+
+  static bool isAllowedAcademicYear(int academicYear) =>
+      academicYear == requiredAcademicYear;
 
   static String normalizeDigits(String input) {
     const arabic = '٠١٢٣٤٥٦٧٨٩';
     const persian = '۰۱۲۳۴۵۶۷۸۹';
     const english = '0123456789';
-
-    String result = input.trim();
-    for (int i = 0; i < 10; i++) {
-      result = result.replaceAll(arabic[i], english[i]);
-      result = result.replaceAll(persian[i], english[i]);
+    var result = input.trim();
+    for (var index = 0; index < 10; index++) {
+      result = result.replaceAll(arabic[index], english[index]);
+      result = result.replaceAll(persian[index], english[index]);
     }
     return result;
   }
 
-  // ─── LOGIN (by University ID & Password) ───────────────
+  Future<AuthUser?> loadUser(firebase_auth.User? firebaseUser) async {
+    if (firebaseUser == null) return null;
+    final snapshot = await _firestore
+        .collection('users')
+        .doc(firebaseUser.uid)
+        .get();
+    final data = snapshot.data();
+    if (!snapshot.exists || data == null) return null;
+    return AuthUser.fromFirestore(firebaseUser.uid, data);
+  }
+
+  static String _authEmailForStudentId(String studentId) =>
+      'student-${studentId.toLowerCase()}@studychallenge-b4869.firebaseapp.com';
+
+  static String _legacyAuthEmailForStudentId(String studentId) =>
+      'student-${studentId.toLowerCase()}@login.study-challenge.invalid';
+
+  static bool _isValidStudentId(String studentId) =>
+      RegExp(r'^[A-Za-z0-9_-]{4,50}$').hasMatch(studentId);
+
   Future<AuthResult> login(
-    String universityIdOrUsername,
+    String studentIdOrLegacyEmail,
     String password,
   ) async {
     try {
-      final cleanIdentifier = normalizeDigits(universityIdOrUsername.trim());
-      final response = await http
-          .post(
-            Uri.parse(AppConstants.loginUrl),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'university_id': cleanIdentifier,
-              'username': cleanIdentifier,
-              'password': password,
-            }),
-          )
-          .timeout(const Duration(seconds: 15));
-
-      Map<String, dynamic> body = {};
-      try {
-        final decoded = jsonDecode(response.body);
-        if (decoded is Map<String, dynamic>) {
-          body = decoded;
-        }
-      } catch (_) {
-        return AuthResult.failure(
-          'استجابة غير متوقعة من الخادم (${response.statusCode})',
+      final identifier = studentIdOrLegacyEmail.trim();
+      if (!identifier.contains('@') &&
+          !_isValidStudentId(normalizeDigits(identifier))) {
+        return const AuthResult.failure('أدخل رقم طالب صالحًا.');
+      }
+      final normalizedIdentifier = normalizeDigits(identifier);
+      final credential = identifier.contains('@')
+          ? await _auth.signInWithEmailAndPassword(
+              email: identifier.toLowerCase(),
+              password: password,
+            )
+          : await _signInWithStudentId(normalizedIdentifier, password);
+      final user = await loadUser(credential.user);
+      if (user == null) {
+        await _auth.signOut();
+        return const AuthResult.failure(
+          'ملف الحساب غير مكتمل. تواصل مع مسؤول التطبيق.',
         );
       }
-
-      if (response.statusCode == 200) {
-        final accessToken = body['access'] as String?;
-        final refreshToken = body['refresh'] as String?;
-
-        if (accessToken == null || refreshToken == null) {
-          return const AuthResult.failure('استجابة غير صالحة من الخادم');
-        }
-
-        // استخراج بيانات المستخدم من الـ JWT payload أو كائن user
-        final payload = _decodeJwtPayload(accessToken);
-        final userObj = body['user'] as Map<String, dynamic>?;
-
-        final user = AuthUser(
-          username:
-              userObj?['username'] ??
-              payload['username'] as String? ??
-              cleanIdentifier,
-          role: userObj?['role'] ?? payload['role'] as String? ?? 'student',
-          universityId:
-              userObj?['university_id'] ??
-              payload['university_id'] as String? ??
-              cleanIdentifier,
-          academicYear: userObj?['academic_year'] is int
-              ? userObj!['academic_year'] as int
-              : (payload['academic_year'] is int
-                    ? payload['academic_year'] as int
-                    : 1),
-          fullName: userObj?['full_name'] as String?,
-          email: userObj?['email'] as String?,
+      if (user.role == 'student' &&
+          !isAllowedAcademicYear(user.academicYear ?? 0)) {
+        await _auth.signOut();
+        return const AuthResult.failure(
+          'الدخول متاح حاليًا لطلاب الفرقة الثانية فقط.',
         );
-
-        // حفظ آمن للـ tokens وبيانات المستخدم
-        await _saveUserSession(accessToken, refreshToken, user);
-
-        return AuthResult.success(user);
       }
-
-      // معالجة أخطاء الـ Validation و Django
-      final detail =
-          body['detail'] ??
-          body['non_field_errors']?.first ??
-          _extractFieldErrors(body) ??
-          'بيانات الدخول غير صحيحة';
-      return AuthResult.failure(detail.toString());
+      if (user.role == 'student' && user.studentStatus == 'suspended') {
+        await _auth.signOut();
+        return const AuthResult.failure(
+          'تم إيقاف هذا الحساب. تواصل مع المالك.',
+        );
+      }
+      return AuthResult.success(user);
+    } on firebase_auth.FirebaseAuthException catch (error) {
+      debugPrint(
+        'Firebase sign-in failed: ${error.code}; ${error.message ?? "No details"}',
+      );
+      return AuthResult.failure(_authErrorMessage(error.code, error.message));
+    } on FirebaseException catch (error) {
+      debugPrint(
+        'Firestore profile load failed: plugin=${error.plugin}; '
+        'code=${error.code}; message=${error.message ?? "No details"}',
+      );
+      return AuthResult.failure(_firestoreErrorMessage(error));
     } on Exception {
-      return const AuthResult.failure(AppConstants.connectionErrorMessage);
+      return const AuthResult.failure('حدث خطأ غير متوقع أثناء تسجيل الدخول.');
     }
   }
 
-  // ─── REGISTER (Sign Up) ────────────────────────────────
   Future<AuthResult> register({
     required String username,
+    required String email,
     required String password,
     required String universityId,
     required int academicYear,
     String? fullName,
-    String? email,
   }) async {
+    firebase_auth.User? firebaseUser;
     try {
-      final cleanId = normalizeDigits(universityId.trim());
-      final cleanUsername = username.trim();
-
-      final response = await http
-          .post(
-            Uri.parse(AppConstants.registerUrl),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'username': cleanUsername,
-              'password': password,
-              'university_id': cleanId,
-              'academic_year': academicYear,
-              if (fullName != null && fullName.isNotEmpty)
-                'full_name': fullName.trim(),
-              if (email != null && email.isNotEmpty) 'email': email.trim(),
-            }),
-          )
-          .timeout(const Duration(seconds: 15));
-
-      Map<String, dynamic> body = {};
-      try {
-        final decoded = jsonDecode(response.body);
-        if (decoded is Map<String, dynamic>) {
-          body = decoded;
-        }
-      } catch (_) {
-        return AuthResult.failure(
-          'استجابة غير متوقعة من الخادم (${response.statusCode})',
+      final normalizedUsername = username.trim().toLowerCase();
+      final normalizedUniversityId = normalizeDigits(universityId);
+      final normalizedContactEmail = email.trim().toLowerCase();
+      if (!RegExp(r'^[a-z0-9_.-]{3,50}$').hasMatch(normalizedUsername)) {
+        return const AuthResult.failure('اسم المستخدم غير صالح.');
+      }
+      if (!_isValidStudentId(normalizedUniversityId)) {
+        return const AuthResult.failure(
+          'رقم الطالب يجب أن يكون من 4 إلى 50 خانة.',
+        );
+      }
+      if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+          .hasMatch(normalizedContactEmail)) {
+        return const AuthResult.failure('صيغة البريد الإلكتروني غير صحيحة.');
+      }
+      if (password.length < 6) {
+        return const AuthResult.failure(
+          'كلمة المرور يجب أن تتكون من 6 أحرف على الأقل.',
+        );
+      }
+      if (!isAllowedAcademicYear(academicYear)) {
+        return const AuthResult.failure(
+          'إنشاء الحساب متاح حاليًا لطلاب الفرقة الثانية فقط.',
         );
       }
 
-      if (response.statusCode == 201) {
-        final accessToken = body['access'] as String?;
-        final refreshToken = body['refresh'] as String?;
-        final userObj = body['user'] as Map<String, dynamic>?;
-
-        final user = AuthUser(
-          username: userObj?['username'] ?? username,
-          role: userObj?['role'] ?? 'student',
-          universityId: userObj?['university_id'] ?? universityId,
-          academicYear: userObj?['academic_year'] is int
-              ? userObj!['academic_year'] as int
-              : academicYear,
-          fullName: userObj?['full_name'] as String? ?? fullName,
-          email: userObj?['email'] as String? ?? email,
-        );
-
-        if (accessToken != null && refreshToken != null) {
-          await _saveUserSession(accessToken, refreshToken, user);
-        }
-
-        return AuthResult.success(user);
+      final credential = await _auth.createUserWithEmailAndPassword(
+        email: _authEmailForStudentId(normalizedUniversityId),
+        password: password,
+      );
+      firebaseUser = credential.user;
+      if (firebaseUser == null) {
+        return const AuthResult.failure('تعذر إنشاء مستخدم Firebase.');
       }
-
-      final errorMsg =
-          _extractFieldErrors(body) ??
-          body['detail']?.toString() ??
-          'فشل إنشاء الحساب';
-      return AuthResult.failure(errorMsg);
-    } on Exception {
-      return const AuthResult.failure(AppConstants.connectionErrorMessage);
+      final userRef = _firestore.collection('users').doc(firebaseUser.uid);
+      final batch = _firestore.batch();
+      batch.set(userRef, {
+        'uid': firebaseUser.uid,
+        'email': normalizedContactEmail,
+        'authEmail': firebaseUser.email,
+        'username': normalizedUsername,
+        'role': 'student',
+        'studentStatus': 'active',
+        'universityId': normalizedUniversityId,
+        'academicYear': academicYear,
+        'fullName': fullName?.trim() ?? '',
+        'profilePicture': '',
+        'xpPoints': 0,
+        'streak': 0,
+        'createdAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+      batch.set(_firestore.collection('usernames').doc(normalizedUsername), {
+        'uid': firebaseUser.uid,
+      });
+      batch.set(
+        _firestore.collection('universityIds').doc(normalizedUniversityId),
+        {'uid': firebaseUser.uid},
+      );
+      await batch.commit();
+      return AuthResult.success(
+        AuthUser.fromFirestore(firebaseUser.uid, {
+          'uid': firebaseUser.uid,
+          'username': normalizedUsername,
+          'role': 'student',
+          'universityId': normalizedUniversityId,
+          'academicYear': academicYear,
+          'fullName': fullName?.trim() ?? '',
+          'email': normalizedContactEmail,
+          'profilePicture': '',
+          'xpPoints': 0,
+          'studentStatus': 'active',
+        }),
+      );
+    } on firebase_auth.FirebaseAuthException catch (error) {
+      debugPrint(
+        'Firebase registration failed: ${error.code}; '
+        '${error.message ?? "No details"}',
+      );
+      await _cleanupFailedRegistration(firebaseUser);
+      if (error.code == 'email-already-in-use') {
+        return const AuthResult.failure('رقم الطالب مسجل بالفعل.');
+      }
+      return AuthResult.failure(_authErrorMessage(error.code, error.message));
+    } on FirebaseException catch (error, stackTrace) {
+      debugPrint(
+        'Firebase registration write failed: '
+        'plugin=${error.plugin}; code=${error.code}; '
+        'message=${error.message ?? error.toString()}\n'
+        'stackTrace:\n$stackTrace',
+      );
+      final cleanupSucceeded = await _cleanupFailedRegistration(firebaseUser);
+      if (!cleanupSucceeded) {
+        return const AuthResult.failure(
+          'تعذر حفظ ملف الحساب، كما تعذر حذف حساب المصادقة تلقائيًا. '
+          'لا تحاول التسجيل بالبريد نفسه مجددًا قبل التواصل مع الدعم.',
+        );
+      }
+      if (error.code == 'permission-denied') {
+        return const AuthResult.failure(
+          'تعذر إنشاء الملف. تحقق من نشر قواعد Firestore، أو جرّب اسم مستخدم '
+          'ورقم طالب مختلفين إذا كان أحدهما مسجلًا.',
+        );
+      }
+      if (error.code == 'already-exists') {
+        return const AuthResult.failure(
+          'اسم المستخدم أو رقم الطالب مستخدم بالفعل.',
+        );
+      }
+      return AuthResult.failure(
+        error.message ?? 'تعذر حفظ الحساب في Firebase.',
+      );
+    } on StateError catch (error, stackTrace) {
+      debugPrint(
+        'Unexpected registration state error: $error\n'
+        'stackTrace:\n$stackTrace',
+      );
+      final cleanupSucceeded = await _cleanupFailedRegistration(firebaseUser);
+      return AuthResult.failure(
+        cleanupSucceeded
+            ? 'لم يتم إنشاء ملف الحساب. حاول مرة أخرى.'
+            : 'تعذر إكمال التسجيل أو حذف حساب المصادقة تلقائيًا. '
+                  'تواصل مع الدعم قبل إعادة المحاولة.',
+      );
+    } on Exception catch (error, stackTrace) {
+      debugPrint(
+        'Unexpected registration exception: $error\n'
+        'stackTrace:\n$stackTrace',
+      );
+      final cleanupSucceeded = await _cleanupFailedRegistration(firebaseUser);
+      return AuthResult.failure(
+        cleanupSucceeded
+            ? 'حدث خطأ غير متوقع أثناء إنشاء الحساب.'
+            : 'تعذر إكمال التسجيل أو حذف حساب المصادقة تلقائيًا. '
+                  'تواصل مع الدعم قبل إعادة المحاولة.',
+      );
+    } catch (error, stackTrace) {
+      debugPrint(
+        'Unexpected registration error: $error\n'
+        'stackTrace:\n$stackTrace',
+      );
+      final cleanupSucceeded = await _cleanupFailedRegistration(firebaseUser);
+      return AuthResult.failure(
+        cleanupSucceeded
+            ? 'حدث خطأ غير متوقع أثناء إنشاء الحساب.'
+            : 'تعذر إكمال التسجيل أو حذف حساب المصادقة تلقائيًا. '
+                  'تواصل مع الدعم قبل إعادة المحاولة.',
+      );
     }
   }
 
-  // ─── REFRESH TOKEN ──────────────────────────────────────
-  Future<String?> refreshAccessToken() async {
-    final refreshToken = await _storage.read(key: AppConstants.keyRefreshToken);
-    if (refreshToken == null) return null;
-
-    try {
-      final response = await http
-          .post(
-            Uri.parse(AppConstants.refreshUrl),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'refresh': refreshToken}),
-          )
-          .timeout(const Duration(seconds: 10));
-
-      if (response.statusCode == 200) {
-        final body = jsonDecode(response.body) as Map<String, dynamic>;
-        final newAccess = body['access'] as String?;
-        final newRefresh = body['refresh'] as String?;
-
-        if (newAccess != null) {
-          await _storage.write(
-            key: AppConstants.keyAccessToken,
-            value: newAccess,
-          );
-          if (newRefresh != null) {
-            await _storage.write(
-              key: AppConstants.keyRefreshToken,
-              value: newRefresh,
-            );
-          }
-          return newAccess;
-        }
-      }
-    } catch (_) {}
-
-    await logout();
-    return null;
-  }
-
-  // ─── LOGOUT ─────────────────────────────────────────────
-  Future<void> logout() async {
-    await _storage.deleteAll();
-  }
-
-  // ─── TOKEN & USER HELPERS ───────────────────────────────
-  Future<String?> getAccessToken() =>
-      _storage.read(key: AppConstants.keyAccessToken);
-  Future<String?> getRefreshToken() =>
-      _storage.read(key: AppConstants.keyRefreshToken);
-
-  Future<bool> isLoggedIn() async {
-    final refresh = await _storage.read(key: AppConstants.keyRefreshToken);
-    return refresh != null && refresh.isNotEmpty;
-  }
-
-  Future<AuthUser?> getStoredUser() async {
-    final username = await _storage.read(key: AppConstants.keyUsername);
-    final role = await _storage.read(key: AppConstants.keyRole);
-    final universityId = await _storage.read(key: AppConstants.keyUniversityId);
-    final yearStr = await _storage.read(key: AppConstants.keyAcademicYear);
-    final fullName = await _storage.read(key: AppConstants.keyFullName);
-
-    if (username == null) return null;
-    return AuthUser(
-      username: username,
-      role: role ?? 'student',
-      universityId: universityId,
-      academicYear: int.tryParse(yearStr ?? ''),
-      fullName: fullName,
-    );
-  }
-
-  // ─── PRIVATE HELPERS ────────────────────────────────────
-  Future<void> _saveUserSession(
-    String accessToken,
-    String refreshToken,
-    AuthUser user,
+  Future<firebase_auth.UserCredential> _signInWithStudentId(
+    String studentId,
+    String password,
   ) async {
-    await Future.wait([
-      _storage.write(key: AppConstants.keyAccessToken, value: accessToken),
-      _storage.write(key: AppConstants.keyRefreshToken, value: refreshToken),
-      _storage.write(key: AppConstants.keyUsername, value: user.username),
-      _storage.write(key: AppConstants.keyRole, value: user.role),
-      if (user.universityId != null)
-        _storage.write(
-          key: AppConstants.keyUniversityId,
-          value: user.universityId!,
-        ),
-      if (user.academicYear != null)
-        _storage.write(
-          key: AppConstants.keyAcademicYear,
-          value: user.academicYear.toString(),
-        ),
-      if (user.fullName != null)
-        _storage.write(key: AppConstants.keyFullName, value: user.fullName!),
-    ]);
-  }
-
-  String? _extractFieldErrors(Map<String, dynamic> body) {
-    final List<String> errors = [];
-    for (final entry in body.entries) {
-      if (entry.value is List) {
-        errors.add((entry.value as List).join(", "));
-      } else if (entry.value is String) {
-        errors.add(entry.value as String);
+    try {
+      return await _auth.signInWithEmailAndPassword(
+        email: _authEmailForStudentId(studentId),
+        password: password,
+      );
+    } on firebase_auth.FirebaseAuthException catch (error) {
+      if (!const [
+        'user-not-found',
+        'wrong-password',
+        'invalid-credential',
+      ].contains(error.code)) {
+        rethrow;
+      }
+      try {
+        return await _auth.signInWithEmailAndPassword(
+          email: _legacyAuthEmailForStudentId(studentId),
+          password: password,
+        );
+      } on firebase_auth.FirebaseAuthException {
+        throw error;
       }
     }
-    return errors.isNotEmpty ? errors.first : null;
   }
 
-  Map<String, dynamic> _decodeJwtPayload(String token) {
+  Future<bool> _cleanupFailedRegistration(
+    firebase_auth.User? firebaseUser,
+  ) async {
+    if (firebaseUser == null) return true;
     try {
-      final parts = token.split('.');
-      if (parts.length != 3) return {};
-      final payload = parts[1];
-      final normalized = base64Url.normalize(payload);
-      final decoded = utf8.decode(base64Url.decode(normalized));
-      return jsonDecode(decoded) as Map<String, dynamic>;
-    } catch (_) {
-      return {};
+      await firebaseUser.delete();
+      return true;
+    } on firebase_auth.FirebaseAuthException catch (error) {
+      debugPrint(
+        'Failed to clean up Firebase registration: ${error.code}; '
+        '${error.message ?? "No details"}',
+      );
+      try {
+        await _auth.signOut();
+      } on firebase_auth.FirebaseAuthException catch (signOutError) {
+        debugPrint(
+          'Failed to sign out after registration error: ${signOutError.code}',
+        );
+      }
+      return false;
+    } on FirebaseException catch (error) {
+      debugPrint('Failed to clean up Firebase registration: ${error.code}');
+      return false;
+    } on Exception catch (error) {
+      debugPrint('Failed to clean up Firebase registration: $error');
+      return false;
     }
+  }
+
+  Future<void> logout() => _auth.signOut();
+
+  Future<AuthUser?> getCurrentUser() async {
+    final user = await loadUser(_auth.currentUser);
+    if (user != null &&
+        user.role == 'student' &&
+        !isAllowedAcademicYear(user.academicYear ?? 0)) {
+      await _auth.signOut();
+      return null;
+    }
+    return user;
+  }
+
+  String _authErrorMessage(String code, [String? details]) {
+    final normalizedDetails = details?.toUpperCase() ?? '';
+    if (normalizedDetails.contains('RECAPTCHA') ||
+        normalizedDetails.contains('PLAY INTEGRITY') ||
+        normalizedDetails.contains('APP_NOT_VERIFIED')) {
+      return 'تعذر التحقق من تطبيق Android لدى Firebase. أضف بصمتي SHA-1 و'
+          'SHA-256 لشهادة التوقيع في إعدادات تطبيق Android داخل Firebase '
+          'Console، ثم نزّل google-services.json من جديد.';
+    }
+    if (normalizedDetails.contains('CONFIGURATION_NOT_FOUND')) {
+      return 'لم يتم إعداد Firebase Authentication لهذا المشروع. افتح '
+          'Firebase Console للمشروع studychallenge-b4869 وفعّل Email/Password '
+          'من Authentication → Sign-in method.';
+    }
+    if (normalizedDetails.contains('OPERATION_NOT_ALLOWED')) {
+      return 'تسجيل البريد وكلمة المرور غير مفعّل. فعّل Email/Password من '
+          'Firebase Console → Authentication → Sign-in method.';
+    }
+    return switch (code) {
+      'invalid-email' => 'صيغة البريد الإلكتروني غير صحيحة.',
+      'operation-not-allowed' =>
+        'تسجيل البريد وكلمة المرور غير مفعّل في Firebase. فعّل Email/Password '
+            'من Authentication ثم Sign-in method في Firebase Console.',
+      'configuration-not-found' =>
+        'لم يتم إعداد Firebase Authentication لهذا المشروع. افتح Firebase '
+            'Console للمشروع studychallenge-b4869 ثم فعّل Email/Password من '
+            'Authentication → Sign-in method.',
+      'app-not-authorized' || 'invalid-api-key' =>
+        'إعداد تطبيق Firebase غير صحيح لهذا المشروع. راجع google-services.json '
+            'وتأكد من تطابق package name.',
+      'user-not-found' ||
+      'wrong-password' ||
+      'invalid-credential' => 'رقم الطالب أو كلمة المرور غير صحيحة.',
+      'email-already-in-use' => 'هذا البريد الإلكتروني مسجل مسبقًا.',
+      'weak-password' => 'كلمة المرور ضعيفة. استخدم 6 أحرف على الأقل.',
+      'too-many-requests' => 'محاولات كثيرة. انتظر قليلًا ثم حاول مجددًا.',
+      'network-request-failed' => 'تحقق من اتصال الإنترنت ثم حاول مجددًا.',
+      'unknown' =>
+        'أعاد Firebase Authentication خطأً داخليًا. تأكد من تفعيل '
+            'Email/Password، وتسجيل بصمتي SHA للتطبيق. '
+            '${details?.trim().isNotEmpty == true ? "تفاصيل Firebase: $details" : "لا توجد تفاصيل إضافية من SDK."}',
+      _ =>
+        'تعذر إتمام المصادقة (رمز Firebase: $code). راجع إعدادات Firebase '
+            'وحاول مرة أخرى.'
+            '${details?.trim().isNotEmpty == true ? " التفاصيل: $details" : ""}',
+    };
+  }
+
+  String _firestoreErrorMessage(FirebaseException error) {
+    return switch (error.code) {
+      'permission-denied' =>
+        'تم التحقق من كلمة المرور، لكن قواعد Firestore منعت قراءة ملف الحساب. '
+            'انشر قواعد Firestore للمشروع ثم حاول مجددًا.',
+      'unavailable' || 'deadline-exceeded' =>
+        'تعذر الوصول إلى Firestore. تحقق من الإنترنت، وتأكد من إنشاء قاعدة '
+            'Firestore الافتراضية (default) في المشروع studychallenge-b4869؛ '
+            'تفعيل Firestore API وحده لا ينشئ قاعدة البيانات.',
+      'not-found' =>
+        'قاعدة بيانات Firestore غير موجودة في مشروع Firebase المحدد. '
+            'أنشئ قاعدة البيانات ثم حاول مجددًا.',
+      'failed-precondition' =>
+        'إعداد Firestore غير مكتمل. تحقق من تفعيل Firestore API وإعداد قاعدة '
+            'البيانات في مشروع Firebase.',
+      _ =>
+        'تعذر تحميل ملف الحساب من Firestore '
+            '(رمز الخطأ: ${error.code}). راجع إعدادات قاعدة البيانات وقواعدها.',
+    };
   }
 }

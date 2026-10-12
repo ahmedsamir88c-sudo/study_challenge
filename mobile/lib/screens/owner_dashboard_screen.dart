@@ -8,6 +8,7 @@ import '../core/constants.dart';
 import '../providers/auth_provider.dart';
 import '../services/api_client.dart';
 import '../widgets/app_components.dart';
+import 'owner_management_screen.dart';
 
 class OwnerDashboardScreen extends StatefulWidget {
   const OwnerDashboardScreen({super.key});
@@ -73,8 +74,16 @@ class _OwnerDashboardScreenState extends State<OwnerDashboardScreen> {
       backgroundColor: AppColors.background,
       appBar: AppBar(
         backgroundColor: AppColors.surface,
+        elevation: 0,
         title: const Text('لوحة المالك'),
         actions: [
+          IconButton(
+            tooltip: 'إدارة المواد والطلاب',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const OwnerManagementScreen()),
+            ),
+            icon: const Icon(Icons.manage_accounts_outlined),
+          ),
           IconButton(
             tooltip: 'تحديث البيانات',
             onPressed: _isLoading ? null : _loadDashboard,
@@ -93,24 +102,36 @@ class _OwnerDashboardScreenState extends State<OwnerDashboardScreen> {
           ),
         ],
       ),
-      body: RefreshIndicator(
-        onRefresh: _loadDashboard,
-        child: ListView(
-          physics: const AlwaysScrollableScrollPhysics(),
-          padding: const EdgeInsets.all(20),
-          children: [
-            _buildWelcome(displayName),
-            const SizedBox(height: 22),
-            if (_isLoading && _dashboard == null)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 56),
-                child: Center(child: CircularProgressIndicator()),
-              )
-            else if (_errorMessage != null && _dashboard == null)
-              _buildErrorState()
-            else
-              _buildMetrics(metrics),
-          ],
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              AppColors.background,
+              Color(0xFF111A2D),
+            ],
+          ),
+        ),
+        child: RefreshIndicator(
+          onRefresh: _loadDashboard,
+          child: ListView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: const EdgeInsets.all(20),
+            children: [
+              _buildWelcome(displayName),
+              const SizedBox(height: 22),
+              if (_isLoading && _dashboard == null)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 56),
+                  child: Center(child: CircularProgressIndicator()),
+                )
+              else if (_errorMessage != null && _dashboard == null)
+                _buildErrorState()
+              else
+                _buildMetrics(metrics),
+            ],
+          ),
         ),
       ),
     );

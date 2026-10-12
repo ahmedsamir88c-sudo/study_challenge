@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -10,11 +11,13 @@ import urllib.error
 
 from django.contrib.auth import authenticate
 from django.conf import settings
-from django.db import IntegrityError, transaction
-from django.db.models import F
+from django.db import DatabaseError, IntegrityError, transaction
+from django.db.models import F, Q
 from django.http import JsonResponse
+from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework import generics, status
+from rest_framework.exceptions import APIException
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -22,19 +25,31 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .models import (
     AISummary,
+    AuditLog,
+    DailyChallenge,
     GeneratedQuizQuestion,
     LectureContent,
+    MaterialDocument,
+    Notification,
+    QuizAttempt,
+    QuizAttemptAnswer,
     QuizQuestionUsage,
+    StudentPreference,
+    Subject,
     User,
 )
 from .permissions import IsAdmin, IsOwner
 from .serializers import LoginSerializer, RegisterSerializer, UpdateProfileSerializer, UserSerializer
 from .services.academic_ai import (
+    ACADEMIC_YEAR_SUBJECTS,
     AcademicAIScopeError,
     ask_academic_question,
+    generate_academic_quiz,
     summarize_academic_lecture,
 )
 from .services.gemini_client import GeminiServiceError
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -64,6 +79,30 @@ class RegisterView(generics.CreateAPIView):
 class LoginView(TokenObtainPairView):
     serializer_class = LoginSerializer
     permission_classes = [AllowAny]
+
+    def post(self, request, *args, **kwargs):
+        try:
+            return super().post(request, *args, **kwargs)
+        except APIException:
+            raise
+        except DatabaseError:
+            logger.exception("Database error while authenticating a user.")
+            return Response(
+                {
+                    "code": "database_unavailable",
+                    "detail": "تعذر التحقق من بيانات الدخول مؤقتًا. يرجى المحاولة لاحقًا.",
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except Exception:
+            logger.exception("Unexpected error while authenticating a user.")
+            return Response(
+                {
+                    "code": "login_failed",
+                    "detail": "حدث خطأ غير متوقع أثناء تسجيل الدخول. يرجى المحاولة لاحقًا.",
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -126,6 +165,146 @@ class OwnerDashboardView(APIView):
         })
 
 
+class OwnerStudentListView(APIView):
+    permission_classes = [IsOwner]
+
+    def get(self, request):
+        students = User.objects.filter(role=User.Role.STUDENT)
+        query = request.query_params.get("search", "").strip()
+        year = request.query_params.get("academic_year", "").strip()
+        account_status = request.query_params.get("status", "").strip().lower()
+        if query:
+            students = students.filter(
+                Q(username__icontains=query)
+                | Q(full_name__icontains=query)
+                | Q(university_id__icontains=query)
+                | Q(email__icontains=query)
+            )
+        if year:
+            try:
+                students = students.filter(academic_year=int(year))
+            except ValueError:
+                return Response(
+                    {"detail": "السنة الدراسية غير صالحة."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        if account_status == "active":
+            students = students.filter(is_active=True)
+        elif account_status == "blocked":
+            students = students.filter(is_active=False)
+        elif account_status:
+            return Response(
+                {"detail": "حالة الحساب غير صالحة."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        page = _parse_integer(request.query_params.get("page", "1"))
+        page_size = _parse_integer(request.query_params.get("page_size", "25"))
+        if page is None or page < 1 or page_size is None or not 1 <= page_size <= 100:
+            return Response(
+                {"detail": "رقم الصفحة أو حجمها غير صالح."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        total = students.count()
+        start = (page - 1) * page_size
+        students = students.order_by("-created_at")[start:start + page_size]
+        results = [
+            {
+                "id": student.id,
+                "username": student.username,
+                "full_name": student.full_name,
+                "university_id": student.university_id or "",
+                "email": student.email or "",
+                "profile_picture": student.profile_picture or "",
+                "academic_year": student.academic_year,
+                "is_active": student.is_active,
+                "student_status": student.student_status,
+                "registered_at": student.created_at.isoformat(),
+                "last_login": (
+                    student.last_login.isoformat() if student.last_login else None
+                ),
+                "last_activity": (
+                    student.last_activity.isoformat()
+                    if student.last_activity
+                    else None
+                ),
+                "xp_points": student.xp_points,
+                "streak": student.streak,
+                "quiz_attempts": student.quiz_attempts.count(),
+            }
+            for student in students
+        ]
+        return Response(
+            {
+                "count": total,
+                "page": page,
+                "page_size": page_size,
+                "results": results,
+            }
+        )
+
+
+class OwnerStudentStatusView(APIView):
+    permission_classes = [IsOwner]
+
+    def post(self, request, pk):
+        is_active = request.data.get("is_active")
+        if not isinstance(is_active, bool):
+            return Response(
+                {"detail": "يجب تحديد حالة الحساب كقيمة منطقية."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        reason = request.data.get("reason", "")
+        if not isinstance(reason, str) or len(reason) > 500:
+            return Response(
+                {"detail": "سبب الإجراء غير صالح أو يتجاوز الحد المسموح."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            with transaction.atomic():
+                student = User.objects.select_for_update().get(
+                    pk=pk,
+                    role=User.Role.STUDENT,
+                )
+                if student.is_active == is_active:
+                    return Response(
+                        {"detail": "الحساب بالفعل في الحالة المطلوبة."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                student.is_active = is_active
+                if not is_active:
+                    student.student_status = User.StudentStatus.SUSPENDED
+                elif student.student_status == User.StudentStatus.SUSPENDED:
+                    student.student_status = User.StudentStatus.APPROVED
+                student.save(update_fields=["is_active", "student_status", "updated_at"])
+                action = "UNBLOCK_STUDENT" if is_active else "BLOCK_STUDENT"
+                AuditLog.objects.create(
+                    user=request.user,
+                    action=action,
+                    details={
+                        "student_id": student.id,
+                        "username": student.username,
+                        "reason": reason.strip(),
+                    },
+                    ip_address=request.META.get("REMOTE_ADDR", ""),
+                )
+        except User.DoesNotExist:
+            return Response(
+                {"detail": "الطالب غير موجود."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        return Response(
+            {
+                "id": student.id,
+                "is_active": student.is_active,
+                "student_status": student.student_status,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 # ─────────────────────────────────────────────────────────────
 # LEADERBOARD
 # ─────────────────────────────────────────────────────────────
@@ -184,7 +363,7 @@ NO_LECTURE_CONTENT_MESSAGE = (
     "عذراً، لا توجد أسئلة أو محاضرات متاحة لهذه المحاضرة حتى الآن، "
     "يجيب الانتظار لحين رفع المحتوى"
 )
-QUESTION_COUNTS = [10, 20, 25, 30, 35, 40, 50, 100]
+QUESTION_COUNTS = [5, 10, 20, 25, 30, 35, 40, 50, 100]
 
 COMPUTER_ARCHITECTURE_LECTURE_QUESTIONS = [
     {
@@ -505,10 +684,50 @@ def _get_questions_for_quiz(
     lecture_number: int,
     user: User,
 ) -> list[dict]:
-    lecture = LectureContent.objects.get(
+    lecture = LectureContent.objects.filter(
         subject=subject,
         lecture_number=lecture_number,
-    )
+    ).first()
+
+    if not lecture or not ((lecture.content or "").strip() or lecture.file):
+        generated = generate_academic_quiz(
+            user=user,
+            subject=subject,
+            academic_year=user.academic_year,
+            lecture_number=lecture_number,
+            difficulty=difficulty,
+            question_type="mcq",
+            count=count,
+        )
+        generated_ids = [
+            question.get("id")
+            for question in generated.get("questions", [])
+            if isinstance(question, dict)
+        ]
+        questions = list(
+            GeneratedQuizQuestion.objects.filter(id__in=generated_ids)
+            .exclude(usage_records__user=user)
+            .order_by("id")
+        )
+        if len(questions) < count:
+            raise QuizQuestionGenerationError(
+                "لم يتم تجهيز عدد كافٍ من أسئلة هذه المحاضرة بعد."
+            )
+        questions = questions[:count]
+        QuizQuestionUsage.objects.bulk_create(
+            [
+                QuizQuestionUsage(user=user, question=question)
+                for question in questions
+            ]
+        )
+        return [
+            {
+                "id": question.id,
+                "question": question.question,
+                "options": question.options,
+            }
+            for question in questions
+        ]
 
     for _ in range(4):
         with transaction.atomic():
@@ -531,13 +750,11 @@ def _get_questions_for_quiz(
                 ])
                 return [
                     {
-                        "id": index,
+                        "id": question.id,
                         "question": question.question,
                         "options": question.options,
-                        "correct_index": question.correct_index,
-                        "explanation": question.explanation,
                     }
-                    for index, question in enumerate(selected, 1)
+                    for question in selected
                 ]
 
         used_questions = list(
@@ -623,12 +840,27 @@ def _parse_integer(value):
     return parsed
 
 
-def _lecture_has_content(subject: str, lecture_number: int) -> bool:
+def _lecture_has_content(
+    subject: str,
+    lecture_number: int,
+    academic_year: int | None = None,
+) -> bool:
     lecture = LectureContent.objects.filter(
         subject=subject,
         lecture_number=lecture_number,
     ).first()
-    return bool(lecture and ((lecture.content or "").strip() or lecture.file))
+    if lecture and ((lecture.content or "").strip() or lecture.file):
+        return True
+
+    documents = MaterialDocument.objects.filter(
+        subject__name=subject,
+        lecture__lecture_number=lecture_number,
+        is_active=True,
+        processing_status=MaterialDocument.ProcessingStatus.READY,
+    )
+    if academic_year is not None:
+        documents = documents.filter(academic_year__year_number=academic_year)
+    return documents.exists()
 
 
 class QuizAvailabilityView(APIView):
@@ -654,7 +886,11 @@ class QuizAvailabilityView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        available = _lecture_has_content(subject, lecture_number)
+        available = _lecture_has_content(
+            subject,
+            lecture_number,
+            request.user.academic_year,
+        )
         return Response({
             "available": available,
             "message": "" if available else NO_LECTURE_CONTENT_MESSAGE,
@@ -700,7 +936,54 @@ class QuizSetupView(APIView):
                 {"detail": "يرجى اختيار مستوى صعوبة صالح."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if not _lecture_has_content(subject, lecture_number):
+        daily_challenge = request.data.get("daily_challenge", False)
+        if not isinstance(daily_challenge, bool):
+            return Response(
+                {"detail": "قيمة التحدي اليومي غير صالحة."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        daily_record = None
+        if daily_challenge:
+            if count != 5:
+                return Response(
+                    {"detail": "يتكون التحدي اليومي من 5 أسئلة."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            today = timezone.localdate()
+            daily_record, _ = DailyChallenge.objects.get_or_create(
+                user=request.user,
+                challenge_date=today,
+            )
+            if daily_record.completed_at is not None:
+                return Response(
+                    {"detail": "أكملت تحدي اليوم بالفعل."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            if daily_record.attempt_id is not None:
+                return Response(
+                    {"detail": "لديك تحدٍ يومي بدأته بالفعل. تابع المحاولة الحالية."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+        if request.user.academic_year:
+            allowed_subjects = ACADEMIC_YEAR_SUBJECTS.get(
+                request.user.academic_year,
+                set(),
+            )
+            if subject not in allowed_subjects and not Subject.objects.filter(
+                name=subject,
+                academic_year__year_number=request.user.academic_year,
+                is_active=True,
+            ).exists():
+                return Response(
+                    {"detail": "هذه المادة غير متاحة لفرقتك الدراسية."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        if not _lecture_has_content(
+            subject,
+            lecture_number,
+            request.user.academic_year,
+        ):
             return Response(
                 {"detail": NO_LECTURE_CONTENT_MESSAGE},
                 status=status.HTTP_404_NOT_FOUND,
@@ -719,12 +1002,58 @@ class QuizSetupView(APIView):
                 {"detail": str(error)},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
+        except AcademicAIScopeError as error:
+            return Response(
+                {"detail": str(error)},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        except GeminiServiceError as error:
+            return Response(
+                {"detail": str(error)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        if len(questions) != count:
+            return Response(
+                {"detail": NO_LECTURE_CONTENT_MESSAGE},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        with transaction.atomic():
+            if daily_record is not None:
+                daily_record = DailyChallenge.objects.select_for_update().get(
+                    pk=daily_record.pk
+                )
+                if daily_record.attempt_id is not None:
+                    return Response(
+                        {"detail": "لديك تحدٍ يومي بدأته بالفعل."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+            attempt = QuizAttempt.objects.create(
+                user=request.user,
+                subject=subject,
+                lecture_number=lecture_number,
+                difficulty=difficulty,
+                total_questions=len(questions),
+            )
+            QuizAttemptAnswer.objects.bulk_create(
+                [
+                    QuizAttemptAnswer(
+                        attempt=attempt,
+                        question_id=question["id"],
+                    )
+                    for question in questions
+                ]
+            )
+            if daily_record is not None:
+                daily_record.attempt = attempt
+                daily_record.save(update_fields=["attempt"])
 
         xp_per_correct = 1
         max_xp = count * xp_per_correct
 
         return Response({
-            "quiz_id": f"custom_{subject[:10].replace(' ', '_')}_l{lecture_number}_{count}_{difficulty}",
+            "quiz_id": str(attempt.attempt_id),
             "subject": subject,
             "lecture": lecture_number,
             "difficulty": difficulty,
@@ -744,9 +1073,9 @@ class QuizListView(APIView):
     def get(self, request):
         subjects = list(QUESTION_BANK.keys())
         difficulties = [
-            {"key": "easy", "label": "سهل", "xp_per_correct": 10},
-            {"key": "medium", "label": "متوسط", "xp_per_correct": 25},
-            {"key": "hard", "label": "صعب", "xp_per_correct": 50},
+            {"key": "easy", "label": "سهل", "xp_per_correct": 1},
+            {"key": "medium", "label": "متوسط", "xp_per_correct": 1},
+            {"key": "hard", "label": "صعب", "xp_per_correct": 1},
         ]
         return Response({
             "subjects": subjects,
@@ -767,28 +1096,154 @@ class QuizSubmitView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        quiz_id = request.data.get("quiz_id", "unknown")
-        score = int(request.data.get("score", 0))
-        total_questions = max(int(request.data.get("total_questions", 1)), 1)
-        earned_xp = int(request.data.get("earned_xp", 0))
+        attempt_id = request.data.get("quiz_id")
+        submitted_answers = request.data.get("answers")
+        if not isinstance(attempt_id, str) or not isinstance(submitted_answers, list):
+            return Response(
+                {"detail": "بيانات تسليم الاختبار غير مكتملة."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        # تحديث XP و Streak
-        user = request.user
-        is_perfect = score == total_questions
+        try:
+            with transaction.atomic():
+                attempt = QuizAttempt.objects.select_for_update().get(
+                    attempt_id=attempt_id,
+                    user=request.user,
+                )
+                if attempt.completed_at is not None:
+                    return Response(
+                        {"detail": "تم تسليم هذا الاختبار من قبل."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
 
-        user.xp_points = F("xp_points") + earned_xp
-        user.xp = F("xp") + earned_xp
-        if is_perfect:
-            user.streak = F("streak") + 1
-        user.save(update_fields=["xp_points", "xp", "streak", "updated_at"])
-        user.refresh_from_db()
+                expected_answers = {
+                    answer.question_id: answer
+                    for answer in attempt.answers.select_related("question")
+                }
+                if (
+                    len(submitted_answers) != len(expected_answers)
+                    or not all(isinstance(item, dict) for item in submitted_answers)
+                ):
+                    return Response(
+                        {"detail": "إجابات الاختبار غير مكتملة أو غير صالحة."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                submitted_ids = []
+                parsed_answers = []
+                for item in submitted_answers:
+                    question_id = _parse_integer(item.get("question_id"))
+                    selected_index = item.get("selected_index")
+                    if selected_index is not None:
+                        selected_index = _parse_integer(selected_index)
+                    if question_id not in expected_answers or selected_index is None and item.get("selected_index") is not None:
+                        return Response(
+                            {"detail": "تتضمن الإجابات سؤالًا أو اختيارًا غير صالح."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    if selected_index is not None and not (
+                        0 <= selected_index < len(expected_answers[question_id].question.options)
+                    ):
+                        return Response(
+                            {"detail": "رقم الاختيار غير صالح."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    submitted_ids.append(question_id)
+                    parsed_answers.append((expected_answers[question_id], selected_index))
+
+                if len(set(submitted_ids)) != len(expected_answers):
+                    return Response(
+                        {"detail": "يجب إرسال إجابة واحدة لكل سؤال."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                score = 0
+                answer_results = []
+                for answer, selected_index in parsed_answers:
+                    question = answer.question
+                    answer.is_correct = selected_index == question.correct_index
+                    answer.selected_index = selected_index
+                    answer.answered_at = timezone.now() if selected_index is not None else None
+                    score += int(answer.is_correct)
+                    answer.save(
+                        update_fields=[
+                            "is_correct",
+                            "selected_index",
+                            "answered_at",
+                        ]
+                    )
+                    answer_results.append(
+                        {
+                            "question_id": question.id,
+                            "question": question.question,
+                            "options": question.options,
+                            "selected_index": selected_index,
+                            "correct_index": question.correct_index,
+                            "is_correct": answer.is_correct,
+                            "explanation": question.explanation,
+                        }
+                    )
+
+                xp_per_correct = 1
+                earned_xp = score * xp_per_correct
+                daily_challenge = DailyChallenge.objects.select_for_update().filter(
+                    user=request.user,
+                    attempt=attempt,
+                    completed_at__isnull=True,
+                ).first()
+                bonus_xp = 0
+                if daily_challenge is not None:
+                    daily_challenge.completed_at = timezone.now()
+                    daily_challenge.bonus_awarded = False
+                    daily_challenge.save(
+                        update_fields=["completed_at", "bonus_awarded"]
+                    )
+                    preferences, _ = StudentPreference.objects.get_or_create(
+                        user=request.user
+                    )
+                    if preferences.notifications_enabled:
+                        Notification.objects.create(
+                            recipient=request.user,
+                            notification_type=Notification.NotificationType.GENERAL,
+                            title="اكتمل التحدي اليومي",
+                            body="أكملت تحدي اليوم بنجاح.",
+                            data={
+                                "kind": "daily_challenge",
+                                "date": daily_challenge.challenge_date.isoformat(),
+                                "bonus_xp": bonus_xp,
+                            },
+                        )
+                attempt.score = score
+                attempt.earned_xp = earned_xp
+                attempt.completed_at = timezone.now()
+                attempt.save(
+                    update_fields=["score", "earned_xp", "completed_at"]
+                )
+
+                user = User.objects.select_for_update().get(pk=request.user.pk)
+                is_perfect = score == attempt.total_questions
+                user.xp_points = F("xp_points") + earned_xp
+                user.xp = F("xp") + earned_xp
+                if is_perfect:
+                    user.streak = F("streak") + 1
+                user.save(update_fields=["xp_points", "xp", "streak", "updated_at"])
+                user.refresh_from_db()
+        except QuizAttempt.DoesNotExist:
+            return Response(
+                {"detail": "الاختبار غير موجود أو لا تملك صلاحية تسليمه."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         return Response({
             "message": f"أحسنت! حصلت على +{earned_xp} XP بنجاح.",
+            "score": score,
+            "total_questions": attempt.total_questions,
             "earned_xp": earned_xp,
+            "bonus_xp": bonus_xp,
             "new_xp": user.xp_points,
             "new_streak": user.streak,
             "is_perfect": is_perfect,
+            "answers": answer_results,
             "user": UserSerializer(user).data,
         })
 

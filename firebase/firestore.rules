@@ -1,0 +1,219 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner() {
+      return signedIn() && request.auth.token.owner == true;
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function validUsername(username) {
+      return username is string
+        && username.matches('^[a-z0-9_.-]{3,50}$');
+    }
+
+    function validUniversityId(universityId) {
+      return universityId is string
+        && universityId.matches('^[A-Za-z0-9_-]{4,50}$');
+    }
+
+    match /users/{uid} {
+      allow get: if isSelf(uid) || isOwner();
+      allow list: if isOwner();
+      allow create: if isSelf(uid)
+        && request.resource.data.keys().hasAll([
+          'uid', 'email', 'authEmail', 'username', 'role', 'studentStatus',
+          'universityId', 'academicYear', 'fullName', 'profilePicture',
+          'xpPoints', 'streak', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'uid', 'email', 'authEmail', 'username', 'role', 'studentStatus',
+          'universityId', 'academicYear', 'fullName', 'profilePicture',
+          'xpPoints', 'streak', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.uid == uid
+        && request.resource.data.email is string
+        && request.resource.data.email.size() <= 254
+        && request.resource.data.authEmail == request.auth.token.email
+        && validUsername(request.resource.data.username)
+        && validUniversityId(request.resource.data.universityId)
+        && request.resource.data.role == 'student'
+        && request.resource.data.studentStatus == 'active'
+        && request.resource.data.academicYear is int
+        && request.resource.data.academicYear == 2
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() <= 150
+        && request.resource.data.profilePicture == ''
+        && request.resource.data.xpPoints == 0
+        && request.resource.data.streak == 0
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && existsAfter(
+          /databases/$(database)/documents/usernames/$(request.resource.data.username)
+        )
+        && getAfter(
+          /databases/$(database)/documents/usernames/$(request.resource.data.username)
+        ).data.uid == uid
+        && existsAfter(
+          /databases/$(database)/documents/universityIds/$(request.resource.data.universityId)
+        )
+        && getAfter(
+          /databases/$(database)/documents/universityIds/$(request.resource.data.universityId)
+        ).data.uid == uid;
+      allow delete: if false;
+      allow update: if isSelf(uid)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['fullName', 'profilePicture', 'updatedAt']);
+    }
+
+    match /universityIds/{id} {
+      allow read: if false;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasAll(['uid'])
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == request.auth.uid
+        && validUniversityId(id)
+        && existsAfter(
+          /databases/$(database)/documents/users/$(request.auth.uid)
+        )
+        && getAfter(
+          /databases/$(database)/documents/users/$(request.auth.uid)
+        ).data.universityId == id;
+      allow update, delete: if false;
+    }
+
+    match /usernames/{username} {
+      allow read: if false;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasAll(['uid'])
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == request.auth.uid
+        && validUsername(username)
+        && existsAfter(
+          /databases/$(database)/documents/users/$(request.auth.uid)
+        )
+        && getAfter(
+          /databases/$(database)/documents/users/$(request.auth.uid)
+        ).data.username == username;
+      allow update, delete: if false;
+    }
+
+    match /firestoreHealthChecks/{uid} {
+      allow get: if isSelf(uid);
+      allow list, delete: if false;
+      allow create, update: if isSelf(uid)
+        && request.resource.data.keys().hasAll(['uid', 'checkId', 'checkedAt'])
+        && request.resource.data.keys().hasOnly(['uid', 'checkId', 'checkedAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.checkId is string
+        && request.resource.data.checkId.size() > 0
+        && request.resource.data.checkId.size() <= 64
+        && request.resource.data.checkedAt == request.time;
+    }
+
+    match /academicYears/{yearId} {
+      allow read: if signedIn();
+      allow write: if isOwner();
+    }
+
+    match /subjects/{subjectId} {
+      allow read: if signedIn();
+      allow write: if isOwner();
+    }
+
+    match /lectures/{lectureId} {
+      allow read: if signedIn();
+      allow write: if isOwner();
+    }
+
+    match /materials/{materialId} {
+      allow read: if signedIn();
+      allow write: if isOwner();
+    }
+
+    match /questionBank/{questionId} {
+      allow read, write: if false;
+    }
+
+    match /lectureChunks/{chunkId} {
+      allow read, write: if false;
+    }
+
+    match /quizAttempts/{attemptId} {
+      allow get, list: if signedIn() && resource.data.uid == request.auth.uid;
+      allow create, update, delete: if false;
+    }
+
+    match /users/{uid}/dailyChallenges/{dateId} {
+      allow read: if isSelf(uid) || isOwner();
+      allow write: if false;
+    }
+
+    match /users/{uid}/studyPlans/{planId} {
+      allow read: if isSelf(uid) || isOwner();
+      allow create: if isSelf(uid)
+        && request.resource.data.keys().hasOnly([
+          'title', 'subjectId', 'targetMinutesPerDay', 'sessionsPerWeek',
+          'startDate', 'endDate', 'notes', 'isActive', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 120
+        && request.resource.data.targetMinutesPerDay is int
+        && request.resource.data.targetMinutesPerDay >= 5
+        && request.resource.data.targetMinutesPerDay <= 600
+        && request.resource.data.sessionsPerWeek is int
+        && request.resource.data.sessionsPerWeek >= 1
+        && request.resource.data.sessionsPerWeek <= 7;
+      allow update: if isSelf(uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'title', 'subjectId', 'targetMinutesPerDay', 'sessionsPerWeek',
+          'startDate', 'endDate', 'notes', 'isActive', 'updatedAt'
+        ]);
+      allow delete: if isSelf(uid);
+    }
+
+    match /users/{uid}/reviewItems/{itemId} {
+      allow read: if isSelf(uid);
+      allow create, delete: if false;
+      allow update: if isSelf(uid)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['reviewedAt', 'reviewCount']);
+    }
+
+    match /users/{uid}/notifications/{notificationId} {
+      allow read: if isSelf(uid);
+      allow create, delete: if false;
+      allow update: if isSelf(uid)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['isRead', 'readAt']);
+    }
+
+    match /users/{uid}/preferences/{preferenceId} {
+      allow read: if isSelf(uid);
+      allow create, update: if isSelf(uid)
+        && preferenceId == 'settings'
+        && request.resource.data.keys().hasOnly([
+          'notificationsEnabled', 'dailyChallengeReminders',
+          'weeklyProgressReports', 'studyGoalMinutes', 'updatedAt'
+        ])
+        && request.resource.data.notificationsEnabled is bool
+        && request.resource.data.dailyChallengeReminders is bool
+        && request.resource.data.weeklyProgressReports is bool
+        && request.resource.data.studyGoalMinutes is int
+        && request.resource.data.studyGoalMinutes >= 5
+        && request.resource.data.studyGoalMinutes <= 600;
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

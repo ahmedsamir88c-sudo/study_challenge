@@ -1,19 +1,8 @@
-import 'dart:io' show Platform;
-
-import 'package:flutter/foundation.dart' show kIsWeb;
-
-/// ثوابت المشروع المركزية — تدعم محاكي الأندرويد وسطح المكتب (Windows) تلقائياً
+/// Identifiers passed to Firebase callable functions; these are not HTTP URLs.
 class AppConstants {
   AppConstants._();
 
-  // ─── Base URL ──────────────────────────────────────────
-  static String get baseUrl {
-    if (kIsWeb) return 'http://127.0.0.1:8000';
-    try {
-      if (Platform.isAndroid) return 'http://10.0.2.2:8000';
-    } catch (_) {}
-    return 'http://127.0.0.1:8000';
-  }
+  static const String baseUrl = 'firebase://study-challenge';
 
   // ─── Auth & App Endpoints ────────────────────────────────
   static String get loginUrl => '$baseUrl/api/auth/login/';
@@ -29,6 +18,44 @@ class AppConstants {
   static String get aiChatUrl => '$baseUrl/api/auth/ai/chat/';
   static String get aiSummaryUrl => '$baseUrl/api/auth/ai/summarize/';
   static String get ownerDashboardUrl => '$baseUrl/api/auth/owner/dashboard/';
+  static String get ownerStudentsUrl => '$baseUrl/api/auth/owner/students/';
+  static String ownerStudentStatusUrl(Object id) =>
+      '$baseUrl/api/auth/owner/students/$id/status/';
+  static String get academicYearsUrl => '$baseUrl/api/academic/years/';
+  static String academicYearUrl(Object id) =>
+      '$baseUrl/api/academic/years/$id/';
+  static String get academicSubjectsUrl => '$baseUrl/api/academic/subjects/';
+  static String academicSubjectUrl(Object id) =>
+      '$baseUrl/api/academic/subjects/$id/';
+  static String get academicLecturesUrl => '$baseUrl/api/academic/lectures/';
+  static String academicLectureUrl(Object id) =>
+      '$baseUrl/api/academic/lectures/$id/';
+  static String get academicMaterialsUrl => '$baseUrl/api/academic/materials/';
+  static String get academicMaterialUploadUrl =>
+      '$baseUrl/api/academic/materials/upload/';
+  static String academicMaterialRetryUrl(Object id) =>
+      '$baseUrl/api/academic/materials/$id/retry/';
+  static String academicMaterialDownloadUrl(Object id) =>
+      '$baseUrl/api/academic/materials/$id/download/';
+  static String academicMaterialUrl(Object id) =>
+      '$baseUrl/api/academic/materials/$id/';
+  static String academicMaterialReplaceUrl(Object id) =>
+      '$baseUrl/api/academic/materials/$id/replace/';
+  static String get studentAcademicHierarchyUrl =>
+      '$baseUrl/api/academic/student/hierarchy/';
+  static String get dailyChallengeUrl => '$baseUrl/api/study/daily-challenge/';
+  static String get smartReviewUrl => '$baseUrl/api/study/review/';
+  static String smartReviewMarkUrl(Object id) =>
+      '$baseUrl/api/study/review/$id/mark/';
+  static String get studyPlansUrl => '$baseUrl/api/study/plans/';
+  static String studyPlanUrl(Object id) => '$baseUrl/api/study/plans/$id/';
+  static String get studyReportsUrl => '$baseUrl/api/study/reports/';
+  static String get notificationsUrl => '$baseUrl/api/study/notifications/';
+  static String get notificationsReadAllUrl =>
+      '$baseUrl/api/study/notifications/read-all/';
+  static String notificationReadUrl(Object id) =>
+      '$baseUrl/api/study/notifications/$id/read/';
+  static String get studentPreferencesUrl => '$baseUrl/api/study/preferences/';
 
   // ─── Secure Storage Keys ────────────────────────────────
   static const String keyAccessToken = 'access_token';
@@ -64,12 +91,12 @@ class AppConstants {
 
   // ─── Subject Lecture Counts ──────────────────────────────
   static const Map<String, int> subjectLectureCounts = {
-    'Digital Logic Design': 6,
-    'Machine Learning': 6,
-    'Computer Networks': 9,
-    'Modeling and Simulation': 6,
-    'Computer Architecture': 6,
-    'Data Structure and Algorithms': 4,
+    'Digital Logic Design': 16,
+    'Machine Learning': 16,
+    'Computer Networks': 16,
+    'Modeling and Simulation': 16,
+    'Computer Architecture': 16,
+    'Data Structure and Algorithms': 16,
   };
 
   // ─── Academic Years & Subjects ──────────────────────────

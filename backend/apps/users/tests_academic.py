@@ -88,6 +88,25 @@ class AcademicMaterialTests(APITestCase):
             defaults={"title": "Supervised Learning"},
         )
 
+    def test_owner_subject_creation_creates_sixteen_lectures(self):
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.post(
+            "/api/academic/subjects/",
+            {
+                "academic_year": self.year4.id,
+                "name": "Sixteen Lecture Test Subject",
+                "code": "CS416",
+                "description": "Subject used to verify lecture creation.",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        subject = Subject.objects.get(id=response.data["id"])
+        self.assertEqual(subject.lectures.count(), 16)
+        self.assertEqual(response.data["lecture_count"], 16)
+
     def test_owner_can_upload_pdf_material(self):
         self.client.force_authenticate(user=self.owner)
         pdf_content = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF"
@@ -133,6 +152,34 @@ class AcademicMaterialTests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_upload_rejects_lecture_from_another_subject(self):
+        self.client.force_authenticate(user=self.owner)
+        other_subject_lecture, _ = Lecture.objects.get_or_create(
+            subject=self.subject_arch,
+            lecture_number=99,
+            defaults={"title": "Architecture lecture"},
+        )
+        uploaded_file = SimpleUploadedFile(
+            "wrong-lecture.txt",
+            b"Academic content",
+            content_type="text/plain",
+        )
+
+        response = self.client.post(
+            "/api/academic/materials/upload/",
+            {
+                "subject_id": self.subject_ml.id,
+                "lecture_id": other_subject_lecture.id,
+                "files": [uploaded_file],
+            },
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(
+            MaterialDocument.objects.filter(original_filename="wrong-lecture.txt").exists()
+        )
+
     def test_file_validation_rejects_invalid_type(self):
         invalid_file = SimpleUploadedFile("script.exe", b"MZ\x90\x00executable", content_type="application/octet-stream")
         with self.assertRaises(FileValidationError):
@@ -160,6 +207,83 @@ class AcademicMaterialTests(APITestCase):
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
+
+
+class AcademicMaterialProcessingTests(APITestCase):
+    def setUp(self):
+        self.student = User.objects.create_user(
+            username="academic-ai-input-student",
+            password="test-password",
+            academic_year=4,
+        )
+        self.client.force_authenticate(user=self.student)
+        self.owner = User.objects.create_superuser(
+            username="material-processing-owner",
+            password="test-password",
+            role=User.Role.OWNER,
+            university_id="42510677",
+        )
+        self.year4, _ = AcademicYear.objects.get_or_create(
+            year_number=4,
+            defaults={"name": "الفرقة الرابعة", "order": 4},
+        )
+        self.year2, _ = AcademicYear.objects.get_or_create(
+            year_number=2,
+            defaults={"name": "الفرقة الثانية", "order": 2},
+        )
+        self.subject_ml, _ = Subject.objects.get_or_create(
+            academic_year=self.year4,
+            name="Machine Learning",
+            defaults={"code": "CS401", "description": "تعلم الآلة"},
+        )
+        self.subject_arch, _ = Subject.objects.get_or_create(
+            academic_year=self.year2,
+            name="Computer Architecture",
+            defaults={"code": "CS201", "description": "معمارية الحاسوب"},
+        )
+        self.lecture_ml1, _ = Lecture.objects.get_or_create(
+            subject=self.subject_ml,
+            lecture_number=1,
+            defaults={"title": "Introduction to Machine Learning"},
+        )
+        self.lecture_ml2, _ = Lecture.objects.get_or_create(
+            subject=self.subject_ml,
+            lecture_number=2,
+            defaults={"title": "Supervised Learning"},
+        )
+
+    def test_quiz_generation_rejects_invalid_count_and_topic_types(self):
+        url = "/api/academic/ai/generate-quiz/"
+        for payload in (
+            {"subject": "Machine Learning", "count": "not-a-number"},
+            {"subject": "Machine Learning", "count": 51},
+            {"subject": "Machine Learning", "topic": {"invalid": "type"}},
+        ):
+            with self.subTest(payload=payload):
+                response = self.client.post(url, payload, format="json")
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_flashcard_generation_rejects_invalid_count(self):
+        response = self.client.post(
+            "/api/academic/ai/generate-flashcards/",
+            {"subject": "Machine Learning", "count": "invalid"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_chat_rejects_invalid_document_id(self):
+        response = self.client.post(
+            "/api/academic/ai/chat/",
+            {
+                "message": "اشرح هذا المحتوى",
+                "subject": "Machine Learning",
+                "document_id": "not-an-id",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     @patch("apps.users.services.material_processor.GeminiClient")
     def test_document_processing_pipeline(self, mock_gemini_cls):
@@ -471,4 +595,3 @@ class AcademicMaterialTests(APITestCase):
         self.assertIn("recent_uploads", response.data)
         self.assertIn("processing_queue", response.data)
         self.assertIn("failed_files", response.data)
-

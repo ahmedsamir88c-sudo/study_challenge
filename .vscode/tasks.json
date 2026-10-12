@@ -1,0 +1,12 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run Flutter app on Android emulator",
+			"type": "shell",
+			"command": "Set-Location 'C:\\projects\\study_challenge\\mobile'; flutter run -d emulator-5554",
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}

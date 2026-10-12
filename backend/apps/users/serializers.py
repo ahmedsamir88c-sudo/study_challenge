@@ -95,8 +95,10 @@ class LoginSerializer(TokenObtainPairSerializer):
         self.fields["username"].required = False
 
     def validate(self, attrs):
-        raw_id = (attrs.get("university_id") or attrs.get("username") or "").strip()
-        password = attrs.get("password", "")
+        raw_identifier = attrs.get("university_id") or attrs.get("username")
+        raw_id = str(raw_identifier or "").strip()
+        password = attrs.get("password")
+        password = password if isinstance(password, str) else ""
 
         if not raw_id:
             raise serializers.ValidationError({"detail": "يرجى إدخال ID الجامعة أو اسم المستخدم."})

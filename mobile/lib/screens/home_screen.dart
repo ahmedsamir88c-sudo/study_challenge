@@ -21,6 +21,7 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   int _currentTabIndex = 0;
+  int _profileRevision = 0;
   Map<String, dynamic>? _profileData;
   bool _hasShownNoLecturesNotice = false;
 
@@ -90,50 +91,84 @@ class _HomeScreenState extends State<HomeScreen> {
 
     return Scaffold(
       backgroundColor: AppColors.background,
-      body: IndexedStack(
-        index: _currentTabIndex,
-        children: [
-          // 0 - الاختبار
-          const QuizSetupScreen(),
-          // 1 - المساعد الذكي
-          const AIChatScreen(),
-          // 2 - المتصدرين
-          LeaderboardScreen(initialYear: academicYear),
-          // 3 - ملفي
-          const ProfileScreen(),
-        ],
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              AppColors.background,
+              Color(0xFF111A2D),
+            ],
+          ),
+        ),
+        child: IndexedStack(
+          index: _currentTabIndex,
+          children: [
+            // 0 - الاختبار
+            const QuizSetupScreen(),
+            // 1 - المساعد الذكي
+            const AIChatScreen(),
+            // 2 - المتصدرين
+            LeaderboardScreen(initialYear: academicYear),
+            // 3 - ملفي
+            ProfileScreen(key: ValueKey(_profileRevision)),
+          ],
+        ),
       ),
-      bottomNavigationBar: NavigationBar(
-        height: 72,
-        selectedIndex: _currentTabIndex,
-        onDestinationSelected: (index) {
-          setState(() => _currentTabIndex = index);
-          if (index == 3) {
-            _loadProfile();
-          }
-        },
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.quiz_outlined),
-            selectedIcon: Icon(Icons.quiz_rounded),
-            label: 'اختبار',
+      bottomNavigationBar: Container(
+        decoration: BoxDecoration(
+          color: AppColors.surface.withAlpha(220),
+          border: Border(
+            top: BorderSide(color: AppColors.border.withAlpha(180), width: 1),
           ),
-          NavigationDestination(
-            icon: Icon(Icons.auto_awesome_outlined),
-            selectedIcon: Icon(Icons.auto_awesome_rounded),
-            label: 'المساعد',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.leaderboard_outlined),
-            selectedIcon: Icon(Icons.leaderboard_rounded),
-            label: 'المتصدرون',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.person_outline_rounded),
-            selectedIcon: Icon(Icons.person_rounded),
-            label: 'ملفي',
-          ),
-        ],
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x33000000),
+              offset: Offset(0, -8),
+              blurRadius: 20,
+            ),
+          ],
+        ),
+        child: NavigationBar(
+          height: 72,
+          backgroundColor: Colors.transparent,
+          surfaceTintColor: Colors.transparent,
+          indicatorColor: AppColors.primaryContainer,
+          shadowColor: Colors.transparent,
+          selectedIndex: _currentTabIndex,
+          onDestinationSelected: (index) {
+            setState(() {
+              _currentTabIndex = index;
+              if (index == 3) _profileRevision++;
+            });
+            if (index == 3) {
+              _loadProfile();
+            }
+          },
+          destinations: const [
+            NavigationDestination(
+              icon: Icon(Icons.quiz_outlined),
+              selectedIcon: Icon(Icons.quiz_rounded),
+              label: 'اختبار',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.auto_awesome_outlined),
+              selectedIcon: Icon(Icons.auto_awesome_rounded),
+              label: 'المساعد',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.leaderboard_outlined),
+              selectedIcon: Icon(Icons.leaderboard_rounded),
+              label: 'المتصدرون',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.person_outline_rounded),
+              selectedIcon: Icon(Icons.person_rounded),
+              label: 'ملفي',
+            ),
+          ],
+        ),
       ),
     );
   }

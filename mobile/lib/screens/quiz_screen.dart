@@ -26,6 +26,11 @@ class _QuizScreenState extends State<QuizScreen> {
   bool _answered = false;
   int _earnedXp = 0;
   bool _isQuizCompleted = false;
+  bool _isSubmitting = false;
+  String? _loadError;
+  String? _submissionError;
+  List<Map<String, dynamic>> _attemptResults = [];
+  final Map<String, int?> _answers = {};
 
   // Timer
   Timer? _timer;
@@ -50,59 +55,37 @@ class _QuizScreenState extends State<QuizScreen> {
       return;
     }
 
-    try {
-      final response = await ApiClient.instance.get(AppConstants.quizzesUrl);
-      if (response.isSuccess &&
-          response.body is Map &&
-          response.body['quizzes'] is List) {
-        final list = response.body['quizzes'] as List;
-        if (list.isNotEmpty) {
-          _loadFromData(list.first as Map<String, dynamic>);
-          return;
-        }
-      }
-    } catch (_) {}
-
-    // Fallback default sample questions
-    _loadFallbackQuestions();
+    setState(() {
+      _isLoading = false;
+      _loadError = 'ابدأ الاختبار من شاشة إعداد الاختبار.';
+    });
   }
 
   void _loadFromData(Map<String, dynamic> data) {
-    final rawQ = data['questions'] as List;
+    final rawQ = data['questions'];
+    if (data['quiz_id'] is! String ||
+        rawQ is! List ||
+        rawQ.isEmpty ||
+        rawQ.any(
+          (item) =>
+              item is! Map ||
+              (item['id'] is! int &&
+                  (item['id'] is! String || (item['id'] as String).isEmpty)) ||
+              item['question'] is! String ||
+              item['options'] is! List ||
+              (item['options'] as List).isEmpty,
+        )) {
+      setState(() {
+        _isLoading = false;
+        _loadError = 'استجابة الاختبار غير صالحة. ارجع وأعد المحاولة.';
+      });
+      return;
+    }
+
     setState(() {
-      _questions = rawQ
+      _questions = (rawQ)
           .map((e) => Map<String, dynamic>.from(e as Map))
           .toList();
-      _isLoading = false;
-    });
-    _startTimer();
-  }
-
-  void _loadFallbackQuestions() {
-    setState(() {
-      _questions = [
-        {
-          "id": 1,
-          "question": "ما هو تعقيد الوقت (Time Complexity) للبحث الثنائي (Binary Search)؟",
-          "options": ["O(n)", "O(log n)", "O(n^2)", "O(1)"],
-          "correct_index": 1,
-          "explanation": "البحث الثنائي يقسم نطاق البحث إلى النصف في كل خطوة.",
-        },
-        {
-          "id": 2,
-          "question": "أي من هياكل البيانات التالية تعتمد على مبدأ LIFO؟",
-          "options": ["Queue", "Stack", "Array", "Linked List"],
-          "correct_index": 1,
-          "explanation": "المكدس (Stack) يعمل بمبدأ Last In First Out.",
-        },
-        {
-          "id": 3,
-          "question": "ما هو البروتوكول المستخدم لنقل البيانات المشفرة والآمنة عبر الويب؟",
-          "options": ["HTTP", "FTP", "HTTPS", "SMTP"],
-          "correct_index": 2,
-          "explanation": "HTTPS يستخدم بروتوكول TLS/SSL لتشفير البيانات.",
-        },
-      ];
       _isLoading = false;
     });
     _startTimer();
@@ -127,20 +110,15 @@ class _QuizScreenState extends State<QuizScreen> {
   }
 
   void _selectOption(int index) {
-    if (_answered) return;
+    if (_answered || _isSubmitting) return;
     _timer?.cancel();
 
     final currentQ = _questions[_currentIndex];
-    final isCorrect = index == currentQ['correct_index'];
 
     setState(() {
       _selectedOption = index;
       _answered = true;
-      if (isCorrect) {
-        _score++;
-        final xpPerCorrect = widget.quizData?['xp_per_correct'];
-        _earnedXp += xpPerCorrect is int ? xpPerCorrect : 25;
-      }
+      _answers[currentQ['id'].toString()] = index >= 0 ? index : null;
     });
   }
 
@@ -158,18 +136,47 @@ class _QuizScreenState extends State<QuizScreen> {
   }
 
   Future<void> _finishQuiz() async {
+    if (_isSubmitting || _isQuizCompleted) return;
     _timer?.cancel();
-    setState(() => _isQuizCompleted = true);
+    setState(() {
+      _isSubmitting = true;
+      _submissionError = null;
+    });
 
-    // Submit results to backend to award XP
-    try {
-      await ApiClient.instance.post(AppConstants.quizSubmitUrl, {
-        'quiz_id': widget.quizData?['id'] ?? 'quiz-1',
-        'score': _score,
-        'total_questions': _questions.length,
-        'earned_xp': _earnedXp,
+    final response = await ApiClient.instance.post(AppConstants.quizSubmitUrl, {
+      'quiz_id': widget.quizData!['quiz_id'],
+      'answers': _questions
+          .map(
+            (question) => {
+              'question_id': question['id'].toString(),
+              'selected_index': _answers[question['id'].toString()],
+            },
+          )
+          .toList(),
+    });
+    if (!mounted) return;
+    final body = response.body;
+    if (!response.isSuccess || body is! Map) {
+      setState(() {
+        _isSubmitting = false;
+        _submissionError = response.errorMessage;
       });
-    } catch (_) {}
+      return;
+    }
+
+    final rawResults = body['answers'];
+    setState(() {
+      _score = body['score'] is int ? body['score'] as int : 0;
+      _earnedXp = body['earned_xp'] is int ? body['earned_xp'] as int : 0;
+      _attemptResults = rawResults is List
+          ? rawResults
+                .whereType<Map>()
+                .map((result) => Map<String, dynamic>.from(result))
+                .toList()
+          : [];
+      _isSubmitting = false;
+      _isQuizCompleted = true;
+    });
   }
 
   @override
@@ -183,6 +190,32 @@ class _QuizScreenState extends State<QuizScreen> {
       );
     }
 
+    if (_loadError != null || _questions.isEmpty) {
+      return Scaffold(
+        backgroundColor: AppColors.background,
+        appBar: AppBar(title: const Text('الاختبار')),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  _loadError ?? 'لا توجد أسئلة متاحة.',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 16),
+                FilledButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('العودة'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
     if (_isQuizCompleted) {
       return _buildResultScreen();
     }
@@ -191,8 +224,6 @@ class _QuizScreenState extends State<QuizScreen> {
     final options = (currentQ['options'] as List)
         .map((e) => e.toString())
         .toList();
-    final correctIndex = currentQ['correct_index'] as int;
-
     return Scaffold(
       backgroundColor: AppColors.background,
       appBar: AppBar(
@@ -230,7 +261,7 @@ class _QuizScreenState extends State<QuizScreen> {
                 ),
                 const SizedBox(width: 4),
                 Text(
-                  '+$_earnedXp XP',
+                  '+$_earnedXp نقطة',
                   style: const TextStyle(
                     color: AppColors.accent,
                     fontSize: 12,
@@ -331,53 +362,29 @@ class _QuizScreenState extends State<QuizScreen> {
                 return _buildOptionTile(
                   index: i,
                   text: options[i],
-                  correctIndex: correctIndex,
+                  isSelected: _selectedOption == i,
                 );
               }),
 
-              // ─── Explanation Box ─────────────────────────────
-              if (_answered && currentQ['explanation'] != null) ...[
+              if (_submissionError != null) ...[
                 const SizedBox(height: 16),
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: AppColors.surfaceElevated,
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(
-                      color: AppColors.secondary.withValues(alpha: 0.4),
-                    ),
-                  ),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Icon(
-                        Icons.info_outline_rounded,
-                        color: AppColors.secondary,
-                        size: 20,
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Text(
-                          currentQ['explanation'].toString(),
-                          style: const TextStyle(
-                            color: AppColors.textSubtle,
-                            fontSize: 13,
-                            height: 1.4,
-                          ),
-                          textDirection: TextDirection.rtl,
-                        ),
-                      ),
-                    ],
-                  ),
+                Text(
+                  'تعذر حفظ النتيجة: $_submissionError',
+                  style: const TextStyle(color: AppColors.error),
+                  textAlign: TextAlign.center,
                 ),
               ],
 
               const SizedBox(height: 24),
 
               // ─── Next Button ─────────────────────────────────
-              if (_answered)
+              if (_answered || _submissionError != null)
                 ElevatedButton(
-                  onPressed: _nextQuestion,
+                  onPressed: _isSubmitting
+                      ? null
+                      : _submissionError != null
+                      ? _finishQuiz
+                      : _nextQuestion,
                   style: ElevatedButton.styleFrom(
                     backgroundColor: AppColors.primary,
                     foregroundColor: AppColors.background,
@@ -386,15 +393,23 @@ class _QuizScreenState extends State<QuizScreen> {
                       borderRadius: BorderRadius.circular(14),
                     ),
                   ),
-                  child: Text(
-                    _currentIndex < _questions.length - 1
-                        ? 'السؤال التالي'
-                        : 'عرض النتيجة النهائية',
-                    style: const TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
+                  child: _isSubmitting
+                      ? const SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : Text(
+                          _submissionError != null
+                              ? 'إعادة إرسال النتيجة'
+                              : _currentIndex < _questions.length - 1
+                              ? 'السؤال التالي'
+                              : 'عرض النتيجة النهائية',
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
                 ),
             ],
           ),
@@ -406,26 +421,10 @@ class _QuizScreenState extends State<QuizScreen> {
   Widget _buildOptionTile({
     required int index,
     required String text,
-    required int correctIndex,
+    required bool isSelected,
   }) {
-    Color borderColor = AppColors.border;
-    Color bgColor = AppColors.surface;
-    IconData? trailingIcon;
-    Color iconColor = Colors.white;
-
-    if (_answered) {
-      if (index == correctIndex) {
-        borderColor = AppColors.success;
-        bgColor = AppColors.surfaceElevated;
-        trailingIcon = Icons.check_circle_rounded;
-        iconColor = AppColors.success;
-      } else if (index == _selectedOption) {
-        borderColor = AppColors.error;
-        bgColor = AppColors.errorSurface;
-        trailingIcon = Icons.cancel_rounded;
-        iconColor = AppColors.error;
-      }
-    }
+    final borderColor = isSelected ? AppColors.primary : AppColors.border;
+    final bgColor = isSelected ? AppColors.surfaceElevated : AppColors.surface;
 
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
@@ -433,7 +432,7 @@ class _QuizScreenState extends State<QuizScreen> {
         color: bgColor,
         borderRadius: BorderRadius.circular(14),
         child: InkWell(
-          onTap: _answered ? null : () => _selectOption(index),
+          onTap: _answered || _isSubmitting ? null : () => _selectOption(index),
           borderRadius: BorderRadius.circular(14),
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
@@ -467,8 +466,12 @@ class _QuizScreenState extends State<QuizScreen> {
                     textDirection: TextDirection.rtl,
                   ),
                 ),
-                if (trailingIcon != null)
-                  Icon(trailingIcon, color: iconColor, size: 22),
+                if (isSelected)
+                  const Icon(
+                    Icons.check_circle_rounded,
+                    color: AppColors.primary,
+                    size: 22,
+                  ),
               ],
             ),
           ),
@@ -526,7 +529,7 @@ class _QuizScreenState extends State<QuizScreen> {
                 ),
                 const SizedBox(height: 32),
 
-                // ─── Score & XP Cards ──────────────────────────
+                // ─── Score & points cards ─────────────────────
                 Row(
                   children: [
                     Expanded(
@@ -563,7 +566,7 @@ class _QuizScreenState extends State<QuizScreen> {
                         child: Column(
                           children: [
                             const Text(
-                              'نقاط الخبرة',
+                              'النقاط',
                               style: TextStyle(
                                 color: AppColors.textMuted,
                                 fontSize: 13,
@@ -571,7 +574,7 @@ class _QuizScreenState extends State<QuizScreen> {
                             ),
                             const SizedBox(height: 6),
                             Text(
-                              '+$_earnedXp XP',
+                              '+$_earnedXp نقطة',
                               style: const TextStyle(
                                 color: AppColors.accent,
                                 fontSize: 22,
@@ -585,6 +588,62 @@ class _QuizScreenState extends State<QuizScreen> {
                   ],
                 ),
                 const SizedBox(height: 36),
+                ..._attemptResults.map((result) {
+                  final options = result['options'] is List
+                      ? (result['options'] as List)
+                            .map((option) => option.toString())
+                            .toList()
+                      : const <String>[];
+                  final selectedIndex = result['selected_index'] as int?;
+                  final correctIndex = result['correct_index'] as int?;
+                  return AppCard(
+                    margin: const EdgeInsets.only(bottom: 12),
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          result['question']?.toString() ?? '',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          selectedIndex != null &&
+                                  selectedIndex >= 0 &&
+                                  selectedIndex < options.length
+                              ? 'إجابتك: ${options[selectedIndex]}'
+                              : 'لم تتم الإجابة.',
+                          style: TextStyle(
+                            color: result['is_correct'] == true
+                                ? AppColors.success
+                                : AppColors.error,
+                          ),
+                        ),
+                        if (correctIndex != null &&
+                            correctIndex >= 0 &&
+                            correctIndex < options.length)
+                          Text(
+                            'الإجابة الصحيحة: ${options[correctIndex]}',
+                            style: const TextStyle(color: AppColors.success),
+                          ),
+                        if (result['explanation'] != null)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 6),
+                            child: Text(
+                              result['explanation'].toString(),
+                              style: const TextStyle(
+                                color: AppColors.textSubtle,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  );
+                }),
+                const SizedBox(height: 24),
 
                 // ─── Action Buttons ────────────────────────────
                 SizedBox(

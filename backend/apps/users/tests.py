@@ -5,18 +5,33 @@ from unittest.mock import patch
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.db.utils import OperationalError
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from PIL import Image
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from .models import AISummary, DocumentChunk, LectureContent, QuizQuestionUsage, User
+from .models import (
+    AISummary,
+    DailyChallenge,
+    DocumentChunk,
+    GeneratedQuizQuestion,
+    LectureContent,
+    Notification,
+    QuizAttemptAnswer,
+    QuizAttempt,
+    QuizQuestionUsage,
+    StudyPlan,
+    User,
+)
 from .services.academic_ai import (
     AcademicAIScopeError,
     NOT_FOUND_MESSAGE,
     ask_academic_question,
     summarize_academic_lecture,
 )
+from .serializers import LoginSerializer
 from .views import NO_LECTURE_CONTENT_MESSAGE
 
 
@@ -76,6 +91,73 @@ class OwnerAccountTests(APITestCase):
         self.assertFalse(existing_user.is_superuser)
 
 
+class LoginErrorHandlingTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="login-student",
+            password="Test-only!Secure-9427",
+            university_id="32276196",
+        )
+        self.url = "/api/auth/login/"
+
+    def test_login_accepts_numeric_university_id(self):
+        response = self.client.post(
+            self.url,
+            {"university_id": 32276196, "password": "Test-only!Secure-9427"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("access", response.data)
+        self.assertEqual(response.data["user"]["university_id"], "32276196")
+
+    def test_login_rejects_missing_identifier_with_json_validation_error(self):
+        response = self.client.post(
+            self.url,
+            {"password": "Test-only!Secure-9427"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("detail", response.data)
+
+    def test_database_error_during_login_returns_safe_json_503(self):
+        with (
+            patch.object(LoginSerializer, "validate", side_effect=OperationalError("database unavailable")),
+            self.assertLogs("apps.users.views", level="ERROR"),
+        ):
+            response = self.client.post(
+                self.url,
+                {"university_id": "32276196", "password": "Test-only!Secure-9427"},
+                format="json",
+            )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+        self.assertEqual(response.data["code"], "database_unavailable")
+        self.assertNotIn("database unavailable", response.content.decode().lower())
+
+    def test_unexpected_login_error_returns_safe_json_500(self):
+        with (
+            patch.object(LoginSerializer, "validate", side_effect=RuntimeError("internal detail")),
+            self.assertLogs("apps.users.views", level="ERROR"),
+        ):
+            response = self.client.post(
+                self.url,
+                {"university_id": "32276196", "password": "Test-only!Secure-9427"},
+                format="json",
+            )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+        self.assertEqual(response.data["code"], "login_failed")
+        self.assertNotIn("internal detail", response.content.decode())
+
+
 class OwnerDashboardTests(APITestCase):
     def setUp(self):
         self.url = "/api/auth/owner/dashboard/"
@@ -115,6 +197,51 @@ class OwnerDashboardTests(APITestCase):
         self.client.force_authenticate(user=student)
 
         response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class OwnerStudentManagementTests(APITestCase):
+    def setUp(self):
+        self.owner = User.objects.create_superuser(
+            username="student-management-owner",
+            password="test-password",
+            role=User.Role.OWNER,
+        )
+        self.student = User.objects.create_user(
+            username="managed-student",
+            password="test-password",
+            full_name="طالب تجريبي",
+            university_id="12345678",
+            academic_year=2,
+        )
+        self.client.force_authenticate(user=self.owner)
+
+    def test_owner_can_search_students_and_change_account_status(self):
+        response = self.client.get(
+            "/api/auth/owner/students/",
+            {"search": "12345678"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["id"], self.student.id)
+
+        response = self.client.post(
+            f"/api/auth/owner/students/{self.student.id}/status/",
+            {"is_active": False, "reason": "اختبار الإدارة"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.student.refresh_from_db()
+        self.assertFalse(self.student.is_active)
+        self.assertEqual(self.student.student_status, User.StudentStatus.SUSPENDED)
+
+    def test_student_cannot_manage_student_accounts(self):
+        self.client.force_authenticate(user=self.student)
+
+        response = self.client.get("/api/auth/owner/students/")
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
@@ -292,6 +419,163 @@ class ComputerArchitectureLectureOneTests(APITestCase):
         }
         self.assertTrue(first_questions.isdisjoint(second_questions))
         self.assertEqual(QuizQuestionUsage.objects.filter(user=self.user).count(), 20)
+
+    @patch(
+        "apps.users.views._generate_questions_from_model",
+        side_effect=lambda lecture, count, difficulty, excluded: (
+            ComputerArchitectureLectureOneTests._generated_questions(
+                "أسئلة التصحيح", count
+            )
+        ),
+    )
+    def test_quiz_is_corrected_server_side_and_cannot_be_submitted_twice(
+        self,
+        generate_questions,
+    ):
+        response = self._request_quiz()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(QuizAttempt.objects.filter(user=self.user).count(), 1)
+        questions = response.data["questions"]
+        self.assertTrue(
+            all("correct_index" not in item and "explanation" not in item for item in questions)
+        )
+        answers = [
+            {
+                "question_id": item["id"],
+                "selected_index": GeneratedQuizQuestion.objects.get(
+                    pk=item["id"]
+                ).correct_index,
+            }
+            for item in questions
+        ]
+
+        submitted = self.client.post(
+            "/api/auth/quizzes/submit/",
+            {
+                "quiz_id": response.data["quiz_id"],
+                "answers": answers,
+                "score": 0,
+                "earned_xp": 999999,
+            },
+            format="json",
+        )
+
+        self.assertEqual(submitted.status_code, status.HTTP_200_OK)
+        self.assertEqual(submitted.data["score"], 10)
+        self.assertEqual(submitted.data["earned_xp"], 10)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.xp_points, 10)
+
+        duplicate = self.client.post(
+            "/api/auth/quizzes/submit/",
+            {"quiz_id": response.data["quiz_id"], "answers": answers},
+            format="json",
+        )
+
+        self.assertEqual(duplicate.status_code, status.HTTP_409_CONFLICT)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.xp_points, 10)
+        generate_questions.assert_called_once()
+
+    @patch(
+        "apps.users.views._generate_questions_from_model",
+        side_effect=lambda lecture, count, difficulty, excluded: (
+            ComputerArchitectureLectureOneTests._generated_questions(
+                "اختبار الملكية", count
+            )
+        ),
+    )
+    def test_quiz_attempt_cannot_be_submitted_by_another_user(self, generate_questions):
+        response = self._request_quiz()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        other_user = User.objects.create_user(
+            username="another-quiz-student",
+            password="test-password",
+        )
+        self.client.force_authenticate(user=other_user)
+        submitted = self.client.post(
+            "/api/auth/quizzes/submit/",
+            {"quiz_id": response.data["quiz_id"], "answers": []},
+            format="json",
+        )
+
+        self.assertEqual(submitted.status_code, status.HTTP_404_NOT_FOUND)
+        generate_questions.assert_called_once()
+
+    @patch(
+        "apps.users.views._generate_questions_from_model",
+        side_effect=lambda lecture, count, difficulty, excluded: (
+            ComputerArchitectureLectureOneTests._generated_questions(
+                "التحدي اليومي", count
+            )
+        ),
+    )
+    def test_daily_challenge_awards_bonus_once_and_notifies_student(
+        self,
+        generate_questions,
+    ):
+        setup = self.client.post(
+            "/api/auth/quizzes/setup/",
+            {
+                "subject": "Computer Architecture",
+                "lecture": 1,
+                "count": 5,
+                "difficulty": "medium",
+                "daily_challenge": True,
+            },
+            format="json",
+        )
+        self.assertEqual(setup.status_code, status.HTTP_200_OK)
+        challenge = DailyChallenge.objects.get(user=self.user)
+        self.assertEqual(str(challenge.attempt.attempt_id), setup.data["quiz_id"])
+
+        answers = [
+            {
+                "question_id": item["id"],
+                "selected_index": GeneratedQuizQuestion.objects.get(
+                    pk=item["id"]
+                ).correct_index,
+            }
+            for item in setup.data["questions"]
+        ]
+        submitted = self.client.post(
+            "/api/auth/quizzes/submit/",
+            {"quiz_id": setup.data["quiz_id"], "answers": answers},
+            format="json",
+        )
+        self.assertEqual(submitted.status_code, status.HTTP_200_OK)
+        self.assertEqual(submitted.data["bonus_xp"], 0)
+        self.assertEqual(submitted.data["earned_xp"], 5)
+        self.assertEqual(
+            Notification.objects.filter(
+                recipient=self.user,
+                data__kind="daily_challenge",
+            ).count(),
+            1,
+        )
+
+        challenge_response = self.client.get("/api/study/daily-challenge/")
+        self.assertEqual(challenge_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(challenge_response.data["completed"])
+        self.assertTrue(challenge_response.data["started"])
+        self.assertIsNone(challenge_response.data["quiz"])
+
+        duplicate = self.client.post(
+            "/api/auth/quizzes/setup/",
+            {
+                "subject": "Computer Architecture",
+                "lecture": 1,
+                "count": 5,
+                "difficulty": "medium",
+                "daily_challenge": True,
+            },
+            format="json",
+        )
+        self.assertEqual(duplicate.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(Notification.objects.filter(recipient=self.user).count(), 1)
+        generate_questions.assert_called_once()
 
     def test_duplicate_generated_questions_are_rejected(self):
         first_batch = self._generated_questions("مكرر", 9)
@@ -520,3 +804,214 @@ class AISummaryAPITests(APITestCase):
                 lecture_number=1,
                 summary_type="quick",
             )
+
+
+class StudyFeatureAPITests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="study-feature-student",
+            password="test-password-123",
+            academic_year=4,
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def test_daily_challenge_has_five_questions_and_is_idempotent(self):
+        first = self.client.get("/api/study/daily-challenge/")
+        second = self.client.get("/api/study/daily-challenge/")
+
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.assertEqual(first.data["goal_questions"], 5)
+        self.assertFalse(first.data["started"])
+        self.assertEqual(second.status_code, status.HTTP_200_OK)
+        self.assertEqual(DailyChallenge.objects.filter(user=self.user).count(), 1)
+
+    def test_smart_review_marks_only_owners_answer(self):
+        attempt = QuizAttempt.objects.create(
+            user=self.user,
+            subject="Computer Architecture",
+            lecture_number=1,
+            difficulty="medium",
+            total_questions=1,
+            score=0,
+            completed_at=timezone.now(),
+        )
+        question = GeneratedQuizQuestion.objects.create(
+            subject=attempt.subject,
+            lecture_number=attempt.lecture_number,
+            difficulty=attempt.difficulty,
+            question="سؤال للمراجعة",
+            options=["أ", "ب"],
+            correct_index=0,
+            explanation="الإجابة الصحيحة هي أ.",
+            fingerprint="review-test-question",
+        )
+        answer = QuizAttemptAnswer.objects.create(
+            attempt=attempt,
+            question=question,
+            selected_index=1,
+            is_correct=False,
+            answered_at=timezone.now(),
+        )
+
+        review = self.client.get("/api/study/review/")
+        self.assertEqual(review.status_code, status.HTTP_200_OK)
+        self.assertEqual(review.data["count"], 1)
+        self.assertEqual(review.data["results"][0]["id"], answer.id)
+
+        marked = self.client.post(
+            f"/api/study/review/{answer.id}/mark/",
+            {},
+            format="json",
+        )
+        self.assertEqual(marked.status_code, status.HTTP_200_OK)
+        self.assertEqual(marked.data["review_count"], 1)
+        self.assertEqual(self.client.get("/api/study/review/").data["count"], 0)
+
+        other_user = User.objects.create_user(
+            username="other-study-student",
+            password="test-password-123",
+            academic_year=4,
+        )
+        self.client.force_authenticate(user=other_user)
+        forbidden_answer = self.client.post(
+            f"/api/study/review/{answer.id}/mark/",
+            {},
+            format="json",
+        )
+        self.assertEqual(forbidden_answer.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_study_plan_crud_and_ownership(self):
+        created = self.client.post(
+            "/api/study/plans/",
+            {
+                "title": "خطة الاستعداد",
+                "target_minutes_per_day": 45,
+                "sessions_per_week": 4,
+                "start_date": timezone.localdate().isoformat(),
+                "notes": "مراجعة الوحدات الأولى",
+            },
+            format="json",
+        )
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED)
+        plan_id = created.data["id"]
+        self.assertEqual(StudyPlan.objects.filter(user=self.user).count(), 1)
+
+        invalid_plan = self.client.patch(
+            f"/api/study/plans/{plan_id}/",
+            {"is_active": "yes"},
+            format="json",
+        )
+        self.assertEqual(invalid_plan.status_code, status.HTTP_400_BAD_REQUEST)
+
+        updated = self.client.patch(
+            f"/api/study/plans/{plan_id}/",
+            {"title": "خطة محدثة", "is_active": False},
+            format="json",
+        )
+        self.assertEqual(updated.status_code, status.HTTP_200_OK)
+        self.assertEqual(updated.data["title"], "خطة محدثة")
+        self.assertFalse(updated.data["is_active"])
+
+        other_user = User.objects.create_user(
+            username="other-plan-student",
+            password="test-password-123",
+            academic_year=4,
+        )
+        self.client.force_authenticate(user=other_user)
+        self.assertEqual(
+            self.client.patch(
+                f"/api/study/plans/{plan_id}/",
+                {"title": "محاولة تعديل"},
+                format="json",
+            ).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_report_aggregates_completed_attempts(self):
+        attempt = QuizAttempt.objects.create(
+            user=self.user,
+            subject="Computer Architecture",
+            lecture_number=1,
+            difficulty="medium",
+            total_questions=4,
+            score=3,
+            earned_xp=3,
+            completed_at=timezone.now(),
+        )
+        question = GeneratedQuizQuestion.objects.create(
+            subject=attempt.subject,
+            lecture_number=attempt.lecture_number,
+            difficulty=attempt.difficulty,
+            question="سؤال عن الذاكرة",
+            options=["أ", "ب", "ج", "د"],
+            correct_index=0,
+            explanation="شرح السؤال",
+            fingerprint="report-focus-area-question",
+            topic="الذاكرة المخبئية",
+        )
+        QuizAttemptAnswer.objects.create(
+            attempt=attempt,
+            question=question,
+            selected_index=1,
+            is_correct=False,
+        )
+
+        response = self.client.get("/api/study/reports/?days=7")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["summary"]["quizzes"], 1)
+        self.assertEqual(response.data["summary"]["questions"], 4)
+        self.assertEqual(response.data["summary"]["correct"], 3)
+        self.assertEqual(response.data["summary"]["xp"], 3)
+        self.assertEqual(response.data["summary"]["accuracy_percent"], 75)
+        self.assertEqual(
+            response.data["focus_areas"][0]["topic"],
+            "الذاكرة المخبئية",
+        )
+
+    def test_notification_reads_and_preferences_are_user_scoped_and_validated(self):
+        own_notification = Notification.objects.create(
+            recipient=self.user,
+            title="إشعار الطالب",
+            body="نص الإشعار",
+        )
+        other_user = User.objects.create_user(
+            username="notification-owner",
+            password="test-password-123",
+            academic_year=4,
+        )
+        other_notification = Notification.objects.create(
+            recipient=other_user,
+            title="إشعار آخر",
+            body="يبقى غير مقروء",
+        )
+
+        unknown_setting = self.client.patch(
+            "/api/study/preferences/",
+            {"updated_at": "not-allowed"},
+            format="json",
+        )
+        self.assertEqual(unknown_setting.status_code, status.HTTP_400_BAD_REQUEST)
+
+        updated_preferences = self.client.patch(
+            "/api/study/preferences/",
+            {
+                "notifications_enabled": False,
+                "study_goal_minutes": 90,
+            },
+            format="json",
+        )
+        self.assertEqual(updated_preferences.status_code, status.HTTP_200_OK)
+        self.assertFalse(updated_preferences.data["notifications_enabled"])
+        self.assertEqual(updated_preferences.data["study_goal_minutes"], 90)
+
+        read_all = self.client.post(
+            "/api/study/notifications/read-all/",
+            {},
+            format="json",
+        )
+        self.assertEqual(read_all.status_code, status.HTTP_200_OK)
+        own_notification.refresh_from_db()
+        other_notification.refresh_from_db()
+        self.assertTrue(own_notification.is_read)
+        self.assertFalse(other_notification.is_read)

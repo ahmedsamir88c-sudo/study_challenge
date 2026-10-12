@@ -9,6 +9,8 @@ urlpatterns = [
     path('api/login/', api_login, name='api_login'),
     path("admin/", admin.site.urls),
     path("api/auth/", include("apps.users.urls")),
+    path("api/academic/", include("apps.users.academic_urls")),
+    path("api/study/", include("apps.users.study_urls")),
     path("api/auth/token/refresh/", TokenRefreshView.as_view(), name="token-refresh"),
     path("api/token/", LoginView.as_view(), name="token-obtain-pair"),
     path("api/token/refresh/", TokenRefreshView.as_view(), name="token-refresh-alt"),

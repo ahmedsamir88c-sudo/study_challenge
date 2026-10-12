@@ -9,7 +9,12 @@ import 'quiz_screen.dart';
 
 class QuizSetupScreen extends StatefulWidget {
   final String? initialSubject;
-  const QuizSetupScreen({super.key, this.initialSubject});
+  final bool isDailyChallenge;
+  const QuizSetupScreen({
+    super.key,
+    this.initialSubject,
+    this.isDailyChallenge = false,
+  });
 
   @override
   State<QuizSetupScreen> createState() => _QuizSetupScreenState();
@@ -34,24 +39,24 @@ class _QuizSetupScreenState extends State<QuizSetupScreen>
       'label': 'سهل',
       'icon': Icons.sentiment_satisfied_rounded,
       'color': AppColors.success,
-      'xp': 10,
-      'desc': '10 XP لكل سؤال صحيح',
+      'xp': 1,
+      'desc': 'نقطة واحدة لكل سؤال صحيح',
     },
     {
       'key': 'medium',
       'label': 'متوسط',
       'icon': Icons.sentiment_neutral_rounded,
       'color': AppColors.accent,
-      'xp': 25,
-      'desc': '25 XP لكل سؤال صحيح',
+      'xp': 1,
+      'desc': 'نقطة واحدة لكل سؤال صحيح',
     },
     {
       'key': 'hard',
       'label': 'صعب',
       'icon': Icons.sentiment_very_dissatisfied_rounded,
       'color': AppColors.error,
-      'xp': 50,
-      'desc': '50 XP لكل سؤال صحيح',
+      'xp': 1,
+      'desc': 'نقطة واحدة لكل سؤال صحيح',
     },
   ];
 
@@ -61,6 +66,10 @@ class _QuizSetupScreenState extends State<QuizSetupScreen>
     if (widget.initialSubject != null &&
         AppConstants.subjects.contains(widget.initialSubject)) {
       _selectedSubject = widget.initialSubject;
+    }
+    if (widget.isDailyChallenge) {
+      _selectedCount = 5;
+      _selectedDifficulty = 'medium';
     }
     _fadeCtrl = AnimationController(
       vsync: this,
@@ -77,8 +86,8 @@ class _QuizSetupScreenState extends State<QuizSetupScreen>
       setState(() {
         _selectedSubject = widget.initialSubject;
         _selectedLecture = null;
-        _selectedCount = null;
-        _selectedDifficulty = null;
+        _selectedCount = widget.isDailyChallenge ? 5 : null;
+        _selectedDifficulty = widget.isDailyChallenge ? 'medium' : null;
       });
     }
   }
@@ -150,6 +159,7 @@ class _QuizSetupScreenState extends State<QuizSetupScreen>
           'lecture': _selectedLecture!,
           'count': _selectedCount!,
           'difficulty': _selectedDifficulty!,
+          if (widget.isDailyChallenge) 'daily_challenge': true,
         },
         timeout: const Duration(seconds: 75),
       );
@@ -335,7 +345,7 @@ class _QuizSetupScreenState extends State<QuizSetupScreen>
               ],
 
               // ─── Step 3: Question Count Dropdown ──────────
-              if (_selectedLecture != null) ...[
+              if (_selectedLecture != null && !widget.isDailyChallenge) ...[
                 AnimatedOpacity(
                   opacity: _selectedLecture != null ? 1.0 : 0.0,
                   duration: const Duration(milliseconds: 300),
@@ -344,6 +354,18 @@ class _QuizSetupScreenState extends State<QuizSetupScreen>
                     title: 'الخطوة الثالثة: اختر عدد الأسئلة',
                     isRequired: true,
                     child: _buildCountDropdown(),
+                  ),
+                ),
+                const SizedBox(height: 18),
+              ],
+              if (_selectedLecture != null && widget.isDailyChallenge) ...[
+                _buildStepCard(
+                  stepNumber: '3',
+                  title: 'التحدي اليومي',
+                  subtitle: '5 أسئلة • نقطة واحدة لكل إجابة صحيحة',
+                  isRequired: true,
+                  child: const Text(
+                    'تم تثبيت عدد الأسئلة حسب التحدي اليومي.',
                   ),
                 ),
                 const SizedBox(height: 18),
@@ -416,8 +438,8 @@ class _QuizSetupScreenState extends State<QuizSetupScreen>
                 const SizedBox(height: 4),
                 Text(
                   _calculatedMaxXp > 0
-                      ? 'يمكنك كسب حتى $_calculatedMaxXp XP في هذا الاختبار'
-                      : 'اختر المادة والمحاضرة للبدء في حصد نقاط الخبرة',
+                      ? 'يمكنك كسب حتى $_calculatedMaxXp نقطة في هذا الاختبار'
+                      : 'اختر المادة والمحاضرة للبدء في حصد النقاط',
                   style: const TextStyle(color: AppColors.accent, fontSize: 13),
                 ),
               ],
@@ -565,8 +587,10 @@ class _QuizSetupScreenState extends State<QuizSetupScreen>
                 _selectedSubject = val;
                 // إعادة تعيين الخيارات التالية عند تغيير المادة
                 _selectedLecture = null;
-                _selectedCount = null;
-                _selectedDifficulty = null;
+                _selectedCount = widget.isDailyChallenge ? 5 : null;
+                _selectedDifficulty = widget.isDailyChallenge
+                    ? 'medium'
+                    : null;
               });
             }
           },
@@ -827,8 +851,8 @@ class _QuizSetupScreenState extends State<QuizSetupScreen>
           _summaryRow('مستوى الصعوبة', diff['label'] as String),
           const Divider(color: AppColors.border, height: 16),
           _summaryRow(
-            'أقصى XP ممكن',
-            '$_calculatedMaxXp نقطة خبرة',
+            'أقصى نقاط ممكنة',
+            '$_calculatedMaxXp نقطة',
             highlight: true,
           ),
         ],

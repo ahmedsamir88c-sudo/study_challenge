@@ -1,16 +1,17 @@
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin, BaseUserManager
 from django.conf import settings
 from django.db import models
+import uuid
 
 
 class LectureContent(models.Model):
     SUBJECT_LECTURE_COUNTS = {
-        "Digital Logic Design": 6,
-        "Machine Learning": 6,
-        "Computer Networks": 9,
-        "Modeling and Simulation": 6,
-        "Computer Architecture": 6,
-        "Data Structure and Algorithms": 4,
+        "Digital Logic Design": 16,
+        "Machine Learning": 16,
+        "Computer Networks": 16,
+        "Modeling and Simulation": 16,
+        "Computer Architecture": 16,
+        "Data Structure and Algorithms": 16,
     }
     SUBJECT_CHOICES = [(subject, subject) for subject in SUBJECT_LECTURE_COUNTS]
 
@@ -338,6 +339,123 @@ class QuizQuestionUsage(models.Model):
                 name="unique_user_quiz_question_usage",
             ),
         ]
+
+
+class QuizAttempt(models.Model):
+    attempt_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="quiz_attempts",
+    )
+    subject = models.CharField(max_length=100)
+    lecture_number = models.PositiveSmallIntegerField()
+    difficulty = models.CharField(max_length=10)
+    total_questions = models.PositiveSmallIntegerField()
+    score = models.PositiveSmallIntegerField(default=0)
+    earned_xp = models.PositiveIntegerField(default=0)
+    started_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+        indexes = [
+            models.Index(fields=("user", "started_at")),
+            models.Index(fields=("subject", "lecture_number")),
+        ]
+
+
+class QuizAttemptAnswer(models.Model):
+    attempt = models.ForeignKey(
+        QuizAttempt,
+        on_delete=models.CASCADE,
+        related_name="answers",
+    )
+    question = models.ForeignKey(
+        GeneratedQuizQuestion,
+        on_delete=models.CASCADE,
+        related_name="attempt_answers",
+    )
+    selected_index = models.PositiveSmallIntegerField(null=True, blank=True)
+    is_correct = models.BooleanField(default=False)
+    answered_at = models.DateTimeField(null=True, blank=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    review_count = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("attempt", "question"),
+                name="unique_attempt_question_answer",
+            ),
+        ]
+
+
+class DailyChallenge(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="daily_challenges",
+    )
+    challenge_date = models.DateField()
+    attempt = models.OneToOneField(
+        QuizAttempt,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="daily_challenge",
+    )
+    completed_at = models.DateTimeField(null=True, blank=True)
+    bonus_awarded = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["-challenge_date"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("user", "challenge_date"),
+                name="unique_user_daily_challenge",
+            ),
+        ]
+
+
+class StudyPlan(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="study_plans",
+    )
+    subject = models.ForeignKey(
+        Subject,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="study_plans",
+    )
+    title = models.CharField(max_length=120)
+    target_minutes_per_day = models.PositiveSmallIntegerField(default=30)
+    sessions_per_week = models.PositiveSmallIntegerField(default=5)
+    start_date = models.DateField()
+    end_date = models.DateField(null=True, blank=True)
+    notes = models.CharField(max_length=500, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-is_active", "start_date", "-created_at"]
+
+
+class StudentPreference(models.Model):
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="study_preferences",
+    )
+    notifications_enabled = models.BooleanField(default=True)
+    daily_challenge_reminders = models.BooleanField(default=True)
+    weekly_progress_reports = models.BooleanField(default=True)
+    study_goal_minutes = models.PositiveSmallIntegerField(default=60)
+    updated_at = models.DateTimeField(auto_now=True)
 
 
 class DocumentChunk(models.Model):

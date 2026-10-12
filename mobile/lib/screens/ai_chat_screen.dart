@@ -33,7 +33,9 @@ class _AIChatScreenState extends State<AIChatScreen> {
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   final List<_ChatMessage> _messages = [];
-  late final List<String> _availableSubjects;
+  List<Map<String, dynamic>> _subjects = [];
+  bool _isLoadingAcademics = true;
+  String? _academicLoadError;
   String? _selectedSubject;
   int _selectedLecture = 1;
   String _selectedSummaryType = 'quick';
@@ -54,20 +56,65 @@ class _AIChatScreenState extends State<AIChatScreen> {
     'راجع تعريفًا من المحتوى',
   ];
 
+  List<String> get _availableSubjects =>
+      _subjects.map((subject) => subject['name']).whereType<String>().toList();
+
+  List<int> get _availableLectures {
+    final subject = _subjects.where((item) => item['name'] == _selectedSubject);
+    if (subject.isEmpty || subject.first['lectures'] is! List) return [];
+    return (subject.first['lectures'] as List)
+        .whereType<Map>()
+        .map((lecture) => lecture['lecture_number'])
+        .whereType<int>()
+        .toList();
+  }
+
   @override
   void initState() {
     super.initState();
-    final academicYear = context.read<AuthProvider>().user?.academicYear ?? 1;
-    _availableSubjects = AppConstants.academicYearSubjects[academicYear] ?? [];
-    _selectedSubject = _availableSubjects.isEmpty
-        ? null
-        : _availableSubjects.first;
     _messages.add(
       _ChatMessage(
         text: 'اختر المادة واسأل عن محتوى محاضراتها وملفاتها الدراسية.',
         isUser: false,
       ),
     );
+    _loadAcademicHierarchy();
+  }
+
+  Future<void> _loadAcademicHierarchy() async {
+    final response = await ApiClient.instance.get(
+      AppConstants.studentAcademicHierarchyUrl,
+    );
+    if (!mounted) return;
+    if (response.isAuthError) {
+      context.read<AuthProvider>().forceLogout();
+      return;
+    }
+    if (!response.isSuccess ||
+        response.body is! Map ||
+        response.body['subjects'] is! List) {
+      setState(() {
+        _isLoadingAcademics = false;
+        _academicLoadError = response.errorMessage;
+      });
+      return;
+    }
+
+    final subjects = (response.body['subjects'] as List)
+        .whereType<Map>()
+        .map((item) => Map<String, dynamic>.from(item))
+        .where((item) => item['name'] is String)
+        .toList();
+    setState(() {
+      _subjects = subjects;
+      _selectedSubject = subjects.isEmpty
+          ? null
+          : subjects.first['name'] as String;
+      final lectures = _availableLectures;
+      _selectedLecture = lectures.isEmpty ? 1 : lectures.first;
+      _isLoadingAcademics = false;
+      _academicLoadError = null;
+    });
   }
 
   @override
@@ -102,6 +149,8 @@ class _AIChatScreenState extends State<AIChatScreen> {
       final response = await ApiClient.instance.post(AppConstants.aiChatUrl, {
         'message': text,
         'subject': _selectedSubject,
+        if (_availableLectures.contains(_selectedLecture))
+          'lecture': _selectedLecture,
       });
 
       String botReply = 'عذراً، حدث خطأ في معالجة طلبك.';
@@ -145,7 +194,12 @@ class _AIChatScreenState extends State<AIChatScreen> {
   }
 
   Future<void> _generateSummary() async {
-    if (_selectedSubject == null || _isTyping || _isSummarizing) return;
+    if (_selectedSubject == null ||
+        !_availableLectures.contains(_selectedLecture) ||
+        _isTyping ||
+        _isSummarizing) {
+      return;
+    }
 
     setState(() => _isSummarizing = true);
     try {
@@ -247,6 +301,16 @@ class _AIChatScreenState extends State<AIChatScreen> {
       body: Column(
         children: [
           _buildSubjectSelector(),
+          if (_academicLoadError != null)
+            MaterialBanner(
+              content: Text(_academicLoadError!),
+              actions: [
+                TextButton(
+                  onPressed: _loadAcademicHierarchy,
+                  child: const Text('إعادة المحاولة'),
+                ),
+              ],
+            ),
           _buildSummaryControls(),
 
           // ─── Messages List ────────────────────────────────
@@ -396,7 +460,11 @@ class _AIChatScreenState extends State<AIChatScreen> {
               child: DropdownButton<String>(
                 value: _selectedSubject,
                 isExpanded: true,
-                hint: const Text('لا توجد مواد متاحة'),
+                hint: Text(
+                  _isLoadingAcademics
+                      ? 'جاري تحميل المواد...'
+                      : 'لا توجد مواد متاحة',
+                ),
                 dropdownColor: AppColors.surface,
                 style: const TextStyle(color: Colors.white, fontSize: 14),
                 items: _availableSubjects
@@ -410,7 +478,11 @@ class _AIChatScreenState extends State<AIChatScreen> {
                       ),
                     )
                     .toList(),
-                onChanged: _isTyping || _isSummarizing
+                onChanged:
+                    _isLoadingAcademics ||
+                        _isTyping ||
+                        _isSummarizing ||
+                        _availableSubjects.isEmpty
                     ? null
                     : (subject) {
                         if (subject == null || subject == _selectedSubject) {
@@ -418,7 +490,10 @@ class _AIChatScreenState extends State<AIChatScreen> {
                         }
                         setState(() {
                           _selectedSubject = subject;
-                          _selectedLecture = 1;
+                          final lectures = _availableLectures;
+                          _selectedLecture = lectures.isEmpty
+                              ? 1
+                              : lectures.first;
                           _messages
                             ..clear()
                             ..add(
@@ -439,9 +514,8 @@ class _AIChatScreenState extends State<AIChatScreen> {
   }
 
   Widget _buildSummaryControls() {
-    final lectureCount =
-        AppConstants.subjectLectureCounts[_selectedSubject] ?? 0;
-    if (lectureCount == 0) return const SizedBox.shrink();
+    final lectures = _availableLectures;
+    if (lectures.isEmpty) return const SizedBox.shrink();
 
     return Theme(
       data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
@@ -460,13 +534,14 @@ class _AIChatScreenState extends State<AIChatScreen> {
                 child: DropdownButtonFormField<int>(
                   initialValue: _selectedLecture,
                   decoration: const InputDecoration(labelText: 'المحاضرة'),
-                  items: List.generate(
-                    lectureCount,
-                    (index) => DropdownMenuItem(
-                      value: index + 1,
-                      child: Text('محاضرة ${index + 1}'),
-                    ),
-                  ),
+                  items: lectures
+                      .map(
+                        (number) => DropdownMenuItem(
+                          value: number,
+                          child: Text('محاضرة $number'),
+                        ),
+                      )
+                      .toList(),
                   onChanged: _isTyping || _isSummarizing
                       ? null
                       : (value) {
@@ -584,10 +659,12 @@ class _AIChatScreenState extends State<AIChatScreen> {
               ...msg.sources.map((source) {
                 final fileName = source['file_name']?.toString() ?? '';
                 final lecture = source['lecture_number']?.toString();
+                final section = source['section_title']?.toString();
                 final page = source['page_number']?.toString();
                 final sourceLabel = [
                   fileName,
                   if (lecture != null) 'محاضرة $lecture',
+                  if (section != null && section.isNotEmpty) section,
                   if (page != null) 'صفحة $page',
                 ].join(' • ');
                 return Padding(

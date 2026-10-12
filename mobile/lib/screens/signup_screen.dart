@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../core/app_theme.dart';
+import '../services/auth_service.dart';
 
 import 'package:provider/provider.dart';
 
@@ -17,9 +18,10 @@ class _SignUpScreenState extends State<SignUpScreen>
     with SingleTickerProviderStateMixin {
   final _formKey = GlobalKey<FormState>();
   final _userController = TextEditingController();
+  final _emailController = TextEditingController();
   final _idController = TextEditingController();
   final _passController = TextEditingController();
-  int _academicYear = 1;
+  int? _academicYear;
   bool _obscurePass = true;
 
   late AnimationController _fadeCtrl;
@@ -39,6 +41,7 @@ class _SignUpScreenState extends State<SignUpScreen>
   void dispose() {
     _fadeCtrl.dispose();
     _userController.dispose();
+    _emailController.dispose();
     _idController.dispose();
     _passController.dispose();
     super.dispose();
@@ -48,11 +51,14 @@ class _SignUpScreenState extends State<SignUpScreen>
     if (!_formKey.currentState!.validate()) return;
 
     final auth = context.read<AuthProvider>();
+    final academicYear = _academicYear;
+    if (academicYear == null) return;
     final success = await auth.register(
       username: _userController.text.trim(),
+      email: _emailController.text.trim(),
       universityId: _idController.text.trim(),
       password: _passController.text,
-      academicYear: _academicYear,
+      academicYear: academicYear,
     );
 
     if (!mounted) return;
@@ -172,6 +178,32 @@ class _SignUpScreenState extends State<SignUpScreen>
                         if (v.trim().length < 3) {
                           return 'يجب أن يكون 3 أحرف على الأقل';
                         }
+                        if (!RegExp(r'^[A-Za-z0-9_.-]{3,50}$')
+                            .hasMatch(v.trim())) {
+                          return 'استخدم الحروف الإنجليزية والأرقام و . _ - فقط';
+                        }
+                        return null;
+                      },
+                    ),
+                    const SizedBox(height: 18),
+
+                    _buildLabel('البريد الإلكتروني'),
+                    const SizedBox(height: 8),
+                    TextFormField(
+                      controller: _emailController,
+                      keyboardType: TextInputType.emailAddress,
+                      textDirection: TextDirection.ltr,
+                      style: const TextStyle(color: Colors.white),
+                      decoration: _inputDeco(
+                        hint: 'name@example.com',
+                        icon: Icons.email_outlined,
+                      ),
+                      validator: (value) {
+                        final email = value?.trim() ?? '';
+                        if (email.isEmpty) return 'البريد الإلكتروني مطلوب';
+                        if (!email.contains('@') || !email.contains('.')) {
+                          return 'أدخل بريدًا إلكترونيًا صالحًا';
+                        }
                         return null;
                       },
                     ),
@@ -193,6 +225,9 @@ class _SignUpScreenState extends State<SignUpScreen>
                         if (v == null || v.trim().isEmpty) {
                           return 'ID الجامعة مطلوب';
                         }
+                        if (v.trim().length < 4 || v.trim().length > 50) {
+                          return 'يجب أن يتكون رقم الطالب من 4 إلى 50 خانة';
+                        }
                         return null;
                       },
                     ),
@@ -201,50 +236,59 @@ class _SignUpScreenState extends State<SignUpScreen>
                     // ─── Academic Year (الفرقة) ──────────────
                     _buildLabel('السنة الدراسية (الفرقة)'),
                     const SizedBox(height: 8),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      decoration: BoxDecoration(
-                        color: AppColors.surface,
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: AppColors.border),
-                      ),
-                      child: DropdownButtonHideUnderline(
-                        child: DropdownButton<int>(
-                          value: _academicYear,
-                          isExpanded: true,
-                          dropdownColor: AppColors.surface,
-                          icon: const Icon(
-                            Icons.keyboard_arrow_down_rounded,
-                            color: AppColors.textMuted,
+                    FormField<int>(
+                      validator: (value) =>
+                          value == AuthService.requiredAcademicYear
+                          ? null
+                          : 'اختر الفرقة الثانية فقط',
+                      builder: (field) => Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            decoration: BoxDecoration(
+                              color: AppColors.surface,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: AppColors.border),
+                            ),
+                            child: DropdownButtonHideUnderline(
+                              child: DropdownButton<int>(
+                                value: field.value,
+                                hint: const Text('اختر الفرقة'),
+                                isExpanded: true,
+                                dropdownColor: AppColors.surface,
+                                icon: const Icon(
+                                  Icons.keyboard_arrow_down_rounded,
+                                  color: AppColors.textMuted,
+                                ),
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 15,
+                                ),
+                                items: const [
+                                  DropdownMenuItem(
+                                    value: AuthService.requiredAcademicYear,
+                                    child: Text('الفرقة الثانية (2)'),
+                                  ),
+                                ],
+                                onChanged: (value) {
+                                  field.didChange(value);
+                                  setState(() => _academicYear = value);
+                                },
+                              ),
+                            ),
                           ),
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 15,
-                          ),
-                          items: const [
-                            DropdownMenuItem(
-                              value: 1,
-                              child: Text('الفرقة الأولى (1)'),
-                            ),
-                            DropdownMenuItem(
-                              value: 2,
-                              child: Text('الفرقة الثانية (2)'),
-                            ),
-                            DropdownMenuItem(
-                              value: 3,
-                              child: Text('الفرقة الثالثة (3)'),
-                            ),
-                            DropdownMenuItem(
-                              value: 4,
-                              child: Text('الفرقة الرابعة (4)'),
+                          if (field.hasError) ...[
+                            const SizedBox(height: 6),
+                            Text(
+                              field.errorText!,
+                              style: TextStyle(
+                                color: AppColors.error,
+                                fontSize: 12,
+                              ),
                             ),
                           ],
-                          onChanged: (v) {
-                            if (v != null) {
-                              setState(() => _academicYear = v);
-                            }
-                          },
-                        ),
+                        ],
                       ),
                     ),
                     const SizedBox(height: 18),

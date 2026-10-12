@@ -2,6 +2,7 @@ from _frozen_importlib import module_from_spec
 from pathlib import Path
 from datetime import timedelta
 import os
+import sys
 
 from dotenv import load_dotenv
 
@@ -61,39 +62,54 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
 
-DATABASE_ENGINE = os.getenv("DATABASE_ENGINE", "").strip()
-if not DATABASE_ENGINE:
-    DATABASE_ENGINE = (
-        "django.db.backends.mysql"
-        if os.getenv("MYSQL_DB")
-        else "django.db.backends.postgresql"
-    )
+DATABASE_ENGINE = os.getenv("DATABASE_ENGINE", "").strip() or os.getenv(
+    "DB_ENGINE",
+    "",
+).strip()
+
+IS_TESTING = "test" in sys.argv or "pytest" in sys.argv[0]
+USE_EXTERNAL_DB_FOR_TESTS = (
+    os.getenv("USE_EXTERNAL_DB_FOR_TESTS", "").strip().lower()
+    in {"1", "true", "yes"}
+)
+
+if IS_TESTING and not USE_EXTERNAL_DB_FOR_TESTS:
+    DATABASE_ENGINE = "django.db.backends.sqlite3"
+elif not DATABASE_ENGINE:
+    DATABASE_ENGINE = "django.db.backends.postgresql"
 
 if DATABASE_ENGINE == "django.db.backends.mysql":
     import pymysql
 
     pymysql.install_as_MySQLdb()
 
-DATABASE_ENV_PREFIX = (
-    "MYSQL" if DATABASE_ENGINE == "django.db.backends.mysql" else "POSTGRES"
-)
-
-DATABASES = {
-    "default": {
-        "ENGINE": DATABASE_ENGINE,
-        "NAME": os.getenv(f"{DATABASE_ENV_PREFIX}_DB", "study_challenge"),
-        "USER": os.getenv(
-            f"{DATABASE_ENV_PREFIX}_USER",
-            "root" if DATABASE_ENV_PREFIX == "MYSQL" else "study_admin",
-        ),
-        "PASSWORD": os.getenv(f"{DATABASE_ENV_PREFIX}_PASSWORD", ""),
-        "HOST": os.getenv(f"{DATABASE_ENV_PREFIX}_HOST", "127.0.0.1"),
-        "PORT": os.getenv(
-            f"{DATABASE_ENV_PREFIX}_PORT",
-            "3306" if DATABASE_ENV_PREFIX == "MYSQL" else "5432",
-        ),
+if DATABASE_ENGINE == "django.db.backends.sqlite3":
+    DATABASES = {
+        "default": {
+            "ENGINE": DATABASE_ENGINE,
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
     }
-}
+else:
+    DATABASE_ENV_PREFIX = (
+        "MYSQL" if DATABASE_ENGINE == "django.db.backends.mysql" else "POSTGRES"
+    )
+    DATABASES = {
+        "default": {
+            "ENGINE": DATABASE_ENGINE,
+            "NAME": os.getenv(f"{DATABASE_ENV_PREFIX}_DB", "study_challenge"),
+            "USER": os.getenv(
+                f"{DATABASE_ENV_PREFIX}_USER",
+                "root" if DATABASE_ENV_PREFIX == "MYSQL" else "study_admin",
+            ),
+            "PASSWORD": os.getenv(f"{DATABASE_ENV_PREFIX}_PASSWORD", ""),
+            "HOST": os.getenv(f"{DATABASE_ENV_PREFIX}_HOST", "127.0.0.1"),
+            "PORT": os.getenv(
+                f"{DATABASE_ENV_PREFIX}_PORT",
+                "3306" if DATABASE_ENV_PREFIX == "MYSQL" else "5432",
+            ),
+        }
+    }
 
 AUTH_USER_MODEL = "users.User"
 OWNER_UNIVERSITY_ID = os.getenv("OWNER_UNIVERSITY_ID", "42510677").strip()

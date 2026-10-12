@@ -1,6 +1,7 @@
 import os
+import logging
 from django.conf import settings
-from django.db.models import Count, Q
+from django.db.models import Count, Prefetch, Q
 from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, permissions, status
@@ -43,12 +44,26 @@ from .services.material_processor import (
     validate_file,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def get_client_ip(request) -> str:
     x_forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
     if x_forwarded_for:
         return x_forwarded_for.split(",")[0].strip()
     return request.META.get("REMOTE_ADDR", "")
+
+
+def _parse_positive_integer(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if str(parsed) != str(value).strip() or parsed < 1:
+        return None
+    return parsed
 
 
 # ─────────────────────────────────────────────────────────────
@@ -152,6 +167,17 @@ class SubjectListCreateView(APIView):
         serializer = SubjectSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         subject = serializer.save()
+        Lecture.objects.bulk_create(
+            [
+                Lecture(
+                    subject=subject,
+                    title=f"المحاضرة {lecture_number}",
+                    lecture_number=lecture_number,
+                    order=lecture_number,
+                )
+                for lecture_number in range(1, 17)
+            ]
+        )
         AuditLog.objects.create(
             user=request.user,
             action="CREATE_SUBJECT",
@@ -289,7 +315,13 @@ class MaterialUploadView(APIView):
         subject_id = request.data.get("subject_id")
         lecture_id = request.data.get("lecture_id")
         academic_year_id = request.data.get("academic_year_id")
-        title = request.data.get("title", "").strip()
+        title = request.data.get("title", "")
+        if not isinstance(title, str):
+            return Response(
+                {"detail": "عنوان الملف غير صالح."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        title = title.strip()
 
         if not subject_id:
             return Response({"detail": "يجب تحديد المادة الدراسية."}, status=status.HTTP_400_BAD_REQUEST)
@@ -297,6 +329,23 @@ class MaterialUploadView(APIView):
         subject = get_object_or_404(Subject.objects.select_related("academic_year"), pk=subject_id)
         lecture = get_object_or_404(Lecture, pk=lecture_id) if lecture_id else None
         year = subject.academic_year
+        if lecture and lecture.subject_id != subject.id:
+            return Response(
+                {"detail": "المحاضرة المحددة لا تتبع المادة المختارة."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if academic_year_id:
+            try:
+                if int(academic_year_id) != year.id:
+                    return Response(
+                        {"detail": "الفرقة الدراسية لا تتطابق مع المادة المختارة."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            except (TypeError, ValueError):
+                return Response(
+                    {"detail": "الفرقة الدراسية غير صالحة."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         # Support single or multiple files
         files = request.FILES.getlist("files")
@@ -348,8 +397,14 @@ class MaterialUploadView(APIView):
 
             except FileValidationError as val_err:
                 errors.append(f"الملف {getattr(f, 'name', '')}: {str(val_err)}")
-            except Exception as e:
-                errors.append(f"الملف {getattr(f, 'name', '')}: تعذر حفظ الملف ({str(e)})")
+            except Exception:
+                logger.exception(
+                    "Failed to store uploaded academic material.",
+                    extra={"subject_id": subject.id, "uploader_id": request.user.id},
+                )
+                errors.append(
+                    f"الملف {getattr(f, 'name', '')}: تعذر حفظ الملف. يرجى المحاولة لاحقًا."
+                )
 
         serializer = MaterialDocumentSerializer(uploaded_docs, many=True, context={"request": request})
         return Response(
@@ -380,10 +435,17 @@ class MaterialListView(APIView):
 
         # Student scope restrictions
         if request.user.role == User.Role.STUDENT:
-            if request.user.academic_year:
-                qs = qs.filter(academic_year__year_number=request.user.academic_year)
+            if not request.user.academic_year:
+                return Response(
+                    {"detail": "يجب تحديد الفرقة الدراسية أولًا."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            qs = qs.filter(academic_year__year_number=request.user.academic_year)
             # Students only see READY materials
-            qs = qs.filter(processing_status=MaterialDocument.ProcessingStatus.READY)
+            qs = qs.filter(
+                processing_status=MaterialDocument.ProcessingStatus.READY,
+                is_active=True,
+            )
 
         if year_param:
             qs = qs.filter(Q(academic_year__year_number=year_param) | Q(academic_year_id=year_param))
@@ -490,7 +552,12 @@ class MaterialDownloadView(APIView):
     def get(self, request, pk):
         doc = get_object_or_404(MaterialDocument, pk=pk)
         if request.user.role == User.Role.STUDENT:
-            if request.user.academic_year and doc.academic_year.year_number != request.user.academic_year:
+            if (
+                not request.user.academic_year
+                or doc.academic_year.year_number != request.user.academic_year
+                or not doc.is_active
+                or doc.processing_status != MaterialDocument.ProcessingStatus.READY
+            ):
                 return Response({"detail": "غير مصرح لك بتحميل هذا الملف."}, status=status.HTTP_403_FORBIDDEN)
 
         if not doc.file or not os.path.exists(doc.file.path):
@@ -566,18 +633,25 @@ class StudentAcademicHierarchyView(APIView):
         if not year_obj:
             return Response({"year": None, "subjects": []})
 
-        subjects = Subject.objects.filter(academic_year=year_obj, is_active=True).prefetch_related(
-            "lectures", "lectures__materials"
+        active_materials = MaterialDocument.objects.filter(
+            is_active=True,
+            processing_status=MaterialDocument.ProcessingStatus.READY,
+        )
+        active_lectures = Lecture.objects.filter(is_active=True).prefetch_related(
+            Prefetch("materials", queryset=active_materials, to_attr="ready_materials")
+        )
+        subjects = Subject.objects.filter(
+            academic_year=year_obj,
+            is_active=True,
+        ).prefetch_related(
+            Prefetch("lectures", queryset=active_lectures, to_attr="active_lectures")
         ).order_by("order", "name")
 
         result_subjects = []
         for s in subjects:
             lectures_data = []
-            for lec in s.lectures.filter(is_active=True).order_by("order", "lecture_number"):
-                ready_materials = lec.materials.filter(
-                    is_active=True,
-                    processing_status=MaterialDocument.ProcessingStatus.READY,
-                )
+            for lec in s.active_lectures:
+                ready_materials = lec.ready_materials
                 lectures_data.append({
                     "id": lec.id,
                     "lecture_number": lec.lecture_number,
@@ -623,8 +697,15 @@ class AcademicAIChatEndpoint(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        message = (request.data.get("message") or "").strip()
-        subject = (request.data.get("subject") or "").strip()
+        message = request.data.get("message")
+        subject = request.data.get("subject")
+        if not isinstance(message, str) or not isinstance(subject, str):
+            return Response(
+                {"detail": "يجب إرسال السؤال والمادة بصيغة نصية."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        message = message.strip()
+        subject = subject.strip()
         lecture = request.data.get("lecture")
         doc_id = request.data.get("document_id")
 
@@ -635,10 +716,20 @@ class AcademicAIChatEndpoint(APIView):
 
         lecture_num = None
         if lecture not in (None, ""):
-            try:
-                lecture_num = int(lecture)
-            except (ValueError, TypeError):
-                pass
+            lecture_num = _parse_positive_integer(lecture)
+            if lecture_num is None:
+                return Response(
+                    {"detail": "رقم المحاضرة غير صالح."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        document_id = None
+        if doc_id not in (None, ""):
+            document_id = _parse_positive_integer(doc_id)
+            if document_id is None:
+                return Response(
+                    {"detail": "معرّف الملف غير صالح."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         try:
             res = ask_academic_question(
@@ -646,46 +737,83 @@ class AcademicAIChatEndpoint(APIView):
                 subject=subject,
                 question=message,
                 lecture_number=lecture_num,
-                document_id=doc_id,
+                document_id=document_id,
             )
             return Response(res, status=status.HTTP_200_OK)
         except AcademicAIScopeError as err:
             return Response({"detail": str(err)}, status=status.HTTP_403_FORBIDDEN)
         except GeminiServiceError as err:
             return Response({"detail": str(err)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        except Exception as err:
-            return Response({"detail": f"حدث خطأ أثناء معالجة السؤال: {str(err)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception:
+            logger.exception(
+                "Unexpected error while answering an academic question.",
+                extra={"user_id": request.user.id},
+            )
+            return Response(
+                {"detail": "حدث خطأ أثناء معالجة السؤال. حاول مرة أخرى لاحقًا."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 class AcademicAIQuizEndpoint(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        subject = (request.data.get("subject") or "").strip()
+        subject = request.data.get("subject")
         lecture = request.data.get("lecture")
         doc_id = request.data.get("document_id")
-        topic = request.data.get("topic", "").strip()
+        topic = request.data.get("topic", "")
         difficulty = request.data.get("difficulty", "medium")
         question_type = request.data.get("question_type", "mcq")
-        count = int(request.data.get("count", 5))
 
-        if not subject:
+        if not isinstance(subject, str) or not subject.strip():
             return Response({"detail": "يرجى اختيار المادة الدراسية."}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(topic, str) or len(topic) > 200:
+            return Response(
+                {"detail": "موضوع الاختبار غير صالح أو يتجاوز الحد المسموح."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        count = _parse_positive_integer(request.data.get("count", 5))
+        if count is None or count > 50:
+            return Response(
+                {"detail": "عدد الأسئلة يجب أن يكون بين 1 و50."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if difficulty not in ("easy", "medium", "hard"):
+            return Response(
+                {"detail": "مستوى الصعوبة غير صالح."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if question_type not in ("mcq", "essay"):
+            return Response(
+                {"detail": "نوع السؤال غير صالح."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         lecture_num = None
         if lecture not in (None, ""):
-            try:
-                lecture_num = int(lecture)
-            except (ValueError, TypeError):
-                pass
+            lecture_num = _parse_positive_integer(lecture)
+            if lecture_num is None:
+                return Response(
+                    {"detail": "رقم المحاضرة غير صالح."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        document_id = None
+        if doc_id not in (None, ""):
+            document_id = _parse_positive_integer(doc_id)
+            if document_id is None:
+                return Response(
+                    {"detail": "معرّف الملف غير صالح."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         try:
             res = generate_academic_quiz(
                 user=request.user,
-                subject=subject,
+                subject=subject.strip(),
                 lecture_number=lecture_num,
-                document_id=doc_id,
-                topic=topic,
+                document_id=document_id,
+                topic=topic.strip(),
                 difficulty=difficulty,
                 question_type=question_type,
                 count=count,
@@ -695,37 +823,64 @@ class AcademicAIQuizEndpoint(APIView):
             return Response({"detail": str(err)}, status=status.HTTP_403_FORBIDDEN)
         except GeminiServiceError as err:
             return Response({"detail": str(err)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        except Exception as err:
-            return Response({"detail": f"تعذر إنشاء الاختبار: {str(err)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception:
+            logger.exception(
+                "Unexpected error while generating an academic quiz.",
+                extra={"user_id": request.user.id},
+            )
+            return Response(
+                {"detail": "تعذر إنشاء الاختبار الآن. حاول مرة أخرى لاحقًا."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 class AcademicAIFlashcardEndpoint(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        subject = (request.data.get("subject") or "").strip()
+        subject = request.data.get("subject")
         lecture = request.data.get("lecture")
         doc_id = request.data.get("document_id")
-        topic = request.data.get("topic", "").strip()
-        count = int(request.data.get("count", 5))
+        topic = request.data.get("topic", "")
 
-        if not subject:
+        if not isinstance(subject, str) or not subject.strip():
             return Response({"detail": "يرجى اختيار المادة الدراسية."}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(topic, str) or len(topic) > 200:
+            return Response(
+                {"detail": "موضوع البطاقات غير صالح أو يتجاوز الحد المسموح."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        count = _parse_positive_integer(request.data.get("count", 5))
+        if count is None or count > 50:
+            return Response(
+                {"detail": "عدد البطاقات يجب أن يكون بين 1 و50."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         lecture_num = None
         if lecture not in (None, ""):
-            try:
-                lecture_num = int(lecture)
-            except (ValueError, TypeError):
-                pass
+            lecture_num = _parse_positive_integer(lecture)
+            if lecture_num is None:
+                return Response(
+                    {"detail": "رقم المحاضرة غير صالح."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        document_id = None
+        if doc_id not in (None, ""):
+            document_id = _parse_positive_integer(doc_id)
+            if document_id is None:
+                return Response(
+                    {"detail": "معرّف الملف غير صالح."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         try:
             res = generate_academic_flashcards(
                 user=request.user,
-                subject=subject,
+                subject=subject.strip(),
                 lecture_number=lecture_num,
-                document_id=doc_id,
-                topic=topic,
+                document_id=document_id,
+                topic=topic.strip(),
                 count=count,
             )
             return Response(res, status=status.HTTP_200_OK)
@@ -733,8 +888,15 @@ class AcademicAIFlashcardEndpoint(APIView):
             return Response({"detail": str(err)}, status=status.HTTP_403_FORBIDDEN)
         except GeminiServiceError as err:
             return Response({"detail": str(err)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        except Exception as err:
-            return Response({"detail": f"تعذر إنشاء البطاقات: {str(err)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception:
+            logger.exception(
+                "Unexpected error while generating academic flashcards.",
+                extra={"user_id": request.user.id},
+            )
+            return Response(
+                {"detail": "تعذر إنشاء البطاقات الآن. حاول مرة أخرى لاحقًا."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 class FlashcardListView(APIView):
@@ -748,4 +910,3 @@ class FlashcardListView(APIView):
         qs = qs.order_by("-created_at")
         serializer = FlashcardSerializer(qs, many=True)
         return Response(serializer.data)
-

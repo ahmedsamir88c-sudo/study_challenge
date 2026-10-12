@@ -24,14 +24,29 @@ class AppCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final effectiveShadow = boxShadow ?? [
+      BoxShadow(
+        color: Colors.black.withAlpha((255 * 0.18).round()),
+        blurRadius: 22,
+        offset: const Offset(0, 10),
+      ),
+    ];
+
     return Container(
       margin: margin,
       padding: padding,
       decoration: BoxDecoration(
-        color: color,
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            color.withAlpha((255 * 0.96).round()),
+            color.withAlpha((255 * 0.88).round()),
+          ],
+        ),
         borderRadius: BorderRadius.circular(borderRadius),
-        border: Border.all(color: borderColor),
-        boxShadow: boxShadow,
+        border: Border.all(color: borderColor.withAlpha((255 * 0.8).round())),
+        boxShadow: effectiveShadow,
       ),
       child: child,
     );
@@ -61,11 +76,22 @@ class AppMetricCard extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Icon(icon, color: accent, size: 21),
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: accent.withAlpha((255 * 0.15).round()),
+              borderRadius: BorderRadius.circular(AppRadii.compact),
+            ),
+            child: Icon(icon, color: accent, size: 21),
+          ),
           Text(
             value,
             style: Theme.of(context).textTheme.headlineSmall
-                ?.copyWith(color: AppColors.text, fontWeight: FontWeight.w700),
+                ?.copyWith(
+                  color: AppColors.text,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: -0.4,
+                ),
           ),
           Text(
             title,

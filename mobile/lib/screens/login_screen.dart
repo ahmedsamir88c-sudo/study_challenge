@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../core/app_theme.dart';
+import '../services/auth_service.dart';
 
 import 'package:provider/provider.dart';
 
@@ -17,7 +18,7 @@ class LoginScreen extends StatefulWidget {
 class _LoginScreenState extends State<LoginScreen>
     with SingleTickerProviderStateMixin {
   final _formKey = GlobalKey<FormState>();
-  final _idController = TextEditingController();
+  final _studentIdController = TextEditingController();
   final _passController = TextEditingController();
   bool _obscurePass = true;
   late AnimationController _fadeCtrl;
@@ -36,7 +37,7 @@ class _LoginScreenState extends State<LoginScreen>
   @override
   void dispose() {
     _fadeCtrl.dispose();
-    _idController.dispose();
+    _studentIdController.dispose();
     _passController.dispose();
     super.dispose();
   }
@@ -46,7 +47,7 @@ class _LoginScreenState extends State<LoginScreen>
 
     final auth = context.read<AuthProvider>();
     final success = await auth.login(
-      _idController.text.trim(),
+      _studentIdController.text.trim(),
       _passController.text,
     );
 
@@ -135,21 +136,35 @@ class _LoginScreenState extends State<LoginScreen>
                     ),
                     const SizedBox(height: 40),
 
-                    // ─── University ID or Username Field ───────
-                    _buildLabel('اسم المستخدم أو ID الجامعة'),
+                    // ─── Student ID Field ─────────────────────
+                    _buildLabel('رقم الطالب (ID)'),
                     const SizedBox(height: 8),
                     TextFormField(
-                      controller: _idController,
+                      controller: _studentIdController,
                       keyboardType: TextInputType.text,
                       textDirection: TextDirection.ltr,
                       style: const TextStyle(color: Colors.white),
                       decoration: _inputDeco(
-                        hint: 'اسم المستخدم أو ID الجامعة أو البريد',
+                        hint: 'رقم الطالب (أو البريد للحسابات القديمة)',
                         icon: Icons.badge_outlined,
                       ),
-                      validator: (v) => (v == null || v.trim().isEmpty)
-                          ? 'يرجى إدخال اسم المستخدم أو ID الجامعة'
-                          : null,
+                      validator: (value) {
+                        final studentId = value?.trim() ?? '';
+                        if (studentId.isEmpty) return 'رقم الطالب مطلوب';
+                        final normalizedId = AuthService.normalizeDigits(
+                          studentId,
+                        );
+                        final isStudentId = RegExp(
+                          r'^[A-Za-z0-9_-]{4,50}$',
+                        ).hasMatch(normalizedId);
+                        final isLegacyEmail = RegExp(
+                          r'^[^@\s]+@[^@\s]+\.[^@\s]+$',
+                        ).hasMatch(studentId);
+                        if (!isStudentId && !isLegacyEmail) {
+                          return 'أدخل رقم طالب صحيحًا';
+                        }
+                        return null;
+                      },
                     ),
                     const SizedBox(height: 20),
 

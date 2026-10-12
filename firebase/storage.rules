@@ -1,0 +1,32 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner() {
+      return signedIn() && request.auth.token.owner == true;
+    }
+
+    match /profilePictures/{uid}/{fileName} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow write: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.size < 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+    }
+
+    match /studyMaterials/{allPaths=**} {
+      allow read: if signedIn();
+      allow write: if isOwner() && (
+        request.resource == null ||
+        request.resource.size <= 30 * 1024 * 1024
+      );
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
