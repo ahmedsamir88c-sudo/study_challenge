@@ -1,0 +1,5 @@
+{
+  "name": "Study Challenge",
+  "description": "Interactive study challenges, quizzes, AI study assistant, spaced review, and academic management for university students.",
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
